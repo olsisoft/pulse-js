@@ -1,0 +1,64 @@
+{
+  "name": "@olsisoft/pulse-client",
+  "version": "2.5.8",
+  "description": "Official JavaScript / TypeScript client for StreamFlow Pulse — AI Agent Platform",
+  "keywords": [
+    "pulse",
+    "streamflow",
+    "ai",
+    "agents",
+    "pipelines",
+    "llm",
+    "mcp",
+    "sdk"
+  ],
+  "homepage": "https://github.com/olsisoft/streamflow",
+  "bugs": "https://github.com/olsisoft/streamflow/issues",
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Njong Michael",
+    "email": "mike.njo@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/olsisoft/streamflow.git",
+    "directory": "pulse-js"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src tests",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@vitest/coverage-v8": "^2.1.8",
+    "eslint": "^9.17.0",
+    "msw": "^2.6.8",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

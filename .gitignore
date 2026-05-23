@@ -1,0 +1,18 @@
+node_modules/
+dist/
+coverage/
+.vitest-cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# npm
+npm-debug.log*
+.npm/
+*.tgz
+
+# tsc / tsup
+*.tsbuildinfo
