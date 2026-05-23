@@ -21,8 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/olsisoft/streamflow.git",
-    "directory": "pulse-js"
+    "url": "git+https://github.com/olsisoft/pulse-js.git"
   },
   "type": "module",
   "main": "./dist/index.cjs",
