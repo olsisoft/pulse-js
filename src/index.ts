@@ -20,6 +20,10 @@ export {
   AgentsResource,
   AuthResource,
   EventsResource,
+  type IQFilterExpression,
+  type IQQueryOptions,
+  IQResource,
+  type IQScanOptions,
   PipelinesResource,
   PulseClient,
   type PulseClientOptions,
@@ -38,4 +42,23 @@ export {
   PulseValidationError,
 } from './errors.js';
 
-export const VERSION = '2.5.8';
+export {
+  aggs,
+  type BranchSpec,
+  type BroadcastJoinOptions,
+  type CdcJoinOptions,
+  type CepOptions,
+  type EnrichAsyncOptions,
+  type EnrichOptions,
+  type FromTopicOptions,
+  type MapOptions,
+  StreamBuilder,
+  type StreamBuilderOptions,
+  StreamsResource,
+  type ToTopicOptions,
+  type WindowOptions,
+  WindowSpec,
+  windows,
+} from './streams.js';
+
+export const VERSION = '2.6.0';

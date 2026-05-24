@@ -19,8 +19,9 @@ import {
   PulseRateLimitError,
   PulseValidationError,
 } from './errors.js';
+import { StreamsResource } from './streams.js';
 
-const USER_AGENT = 'pulse-client-js/2.5.8';
+const USER_AGENT = 'pulse-client-js/2.6.0';
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface PulseClientOptions {
@@ -72,6 +73,8 @@ export class PulseClient {
   public readonly templates: TemplatesResource;
   public readonly users: UsersResource;
   public readonly events: EventsResource;
+  public readonly iq: IQResource;
+  public readonly streams: StreamsResource;
 
   constructor(options: PulseClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, '');
@@ -89,6 +92,8 @@ export class PulseClient {
     this.templates = new TemplatesResource(this);
     this.users = new UsersResource(this);
     this.events = new EventsResource(this);
+    this.iq = new IQResource(this);
+    this.streams = new StreamsResource(this);
   }
 
   /** @internal — exposed so EventsResource can build its SSE URL. */
@@ -314,7 +319,7 @@ export class PipelinesResource extends Resource {
   }
 }
 
-/** client.agents — inspect deployed agents (read-only). */
+/** client.agents — list / get / update / delete deployed agents. */
 export class AgentsResource extends Resource {
   /** GET /api/pulse/agents — every deployed agent in the current org. */
   public async list(): Promise<Record<string, unknown>[]> {
@@ -332,6 +337,50 @@ export class AgentsResource extends Resource {
       method: 'GET',
       path: `/api/pulse/agents/${encodeURIComponent(agentId)}`,
     })) as Record<string, unknown>;
+  }
+
+  /**
+   * B-115 Phase 1 — `PUT /api/pulse/agents/{id}`: replace the agent's config.
+   *
+   * `config` is the FULL agent config (not a partial merge) — at minimum
+   * `name`. Optional fields (`engineType`, `inputTopic`, `outputTopic`,
+   * `description`, `instances`, `monthlyBudget`, `config`) fall back to safe
+   * defaults when omitted. See the `UpdateAgentRequest` schema in
+   * `openapi.yaml`.
+   *
+   * Today this triggers a full stop + persist + start cycle on the engine
+   * side — the agent is briefly unavailable while the swap happens.
+   * Existing state in the agent's keyed store is preserved. Phase 2
+   * (B-115-engine) will add atomic event-boundary swap so hot-reloadable
+   * changes apply with no downtime.
+   *
+   * Returns the post-update agent snapshot (same shape as {@link get}).
+   * Throws {@link PulseValidationError} on a bad config (self-loop, invalid
+   * streaming operators), {@link PulseNotFoundError} if the agent doesn't
+   * exist.
+   */
+  public async update(
+    agentId: string,
+    config: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'PUT',
+      path: `/api/pulse/agents/${encodeURIComponent(agentId)}`,
+      body: config,
+    })) as Record<string, unknown>;
+  }
+
+  /**
+   * `DELETE /api/pulse/agents/{id}` — stop the agent + remove its config row.
+   *
+   * The agent's keyed state store is also dropped. Requires the
+   * `AGENT_DELETE` permission.
+   */
+  public async delete(agentId: string): Promise<void> {
+    await this.client.request({
+      method: 'DELETE',
+      path: `/api/pulse/agents/${encodeURIComponent(agentId)}`,
+    });
   }
 }
 
@@ -476,4 +525,166 @@ export class UsersResource extends Resource {
     const users = result?.users;
     return Array.isArray(users) ? (users as Record<string, unknown>[]) : [];
   }
+}
+
+/** Optional range + limit for {@link IQResource.scan} / {@link IQResource.listKeys}. */
+export interface IQScanOptions {
+  /** Inclusive lower bound on the key range. Omit for beginning. */
+  start?: string;
+  /** Exclusive upper bound on the key range. Omit for end. */
+  end?: string;
+  /** Page size; server clamps to [1, 1000]. Default 100. */
+  limit?: number;
+}
+
+/**
+ * Filter expression for {@link IQResource.query}. Recursive: each node MUST carry
+ * exactly ONE discriminator — `field` (leaf), `and`, `or`, or `not`. Mixing in a
+ * single node is rejected with HTTP 400.
+ *
+ * Use `'$value'` as `field` to test the value itself for scalar (non-map) states.
+ */
+export interface IQFilterExpression {
+  field?: string;
+  op?: 'eq' | 'neq' | 'exists' | 'notexists' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'in';
+  value?: unknown;
+  and?: IQFilterExpression[];
+  or?: IQFilterExpression[];
+  not?: IQFilterExpression;
+}
+
+/** Optional inputs for {@link IQResource.query}. */
+export interface IQQueryOptions {
+  start?: string;
+  end?: string;
+  limit?: number;
+  filter?: IQFilterExpression;
+  /** Field names to include in returned entries. Non-map values pass through. */
+  projection?: string[];
+  /**
+   * Field name to group on. Switches the response shape from flat
+   * `{entries, ...}` to grouped `{groups: [{groupKey, count}], ...}`.
+   * Use `'$value'` for scalar states.
+   */
+  groupBy?: string;
+}
+
+/**
+ * client.iq — B-106 Interactive Queries.
+ *
+ * Query the live state of streaming agents like a database from any
+ * microservice. The killer use case is a synchronous decision service
+ * (fraud, rate-limit, pricing) calling {@link get} on every request and
+ * reading agent state from RAM with zero ingest-to-decision lag:
+ *
+ * @example
+ * ```ts
+ * const state = await client.iq.get('fraud-detector', 'customer-42');
+ * if ((state.value as { tx_count_60s: number }).tx_count_60s > 5) {
+ *   denyPayment();
+ * }
+ * ```
+ *
+ * All methods require the `AGENT_READ` permission (Owner, Platform Admin,
+ * Developer, Auditor personas by default — see B-105).
+ *
+ * Responses are returned as raw `Record<string, unknown>` objects so callers
+ * can paginate, inspect `truncated`/`limitApplied`/`totalScanned` metadata,
+ * and read fields without going through a wrapper layer.
+ */
+export class IQResource extends Resource {
+  /** GET /api/pulse/iq/agents/{id}/state — headline state summary. */
+  public async summary(agentId: string): Promise<Record<string, unknown>> {
+    const path = `/api/pulse/iq/agents/${encodeURIComponent(agentId)}/state`;
+    return (await this.client.request({ method: 'GET', path })) as Record<string, unknown>;
+  }
+
+  /**
+   * GET /api/pulse/iq/agents/{id}/state/value/{key} — point lookup.
+   *
+   * @throws PulseNotFoundError when the key is absent OR the agent is not
+   *   queryable. Inspect `error.body.error` ("Key not found" vs "Agent has
+   *   no queryable state") to differentiate; `error.body.reason` carries
+   *   the not-queryable cause.
+   */
+  public async get(agentId: string, key: string): Promise<Record<string, unknown>> {
+    const path =
+      `/api/pulse/iq/agents/${encodeURIComponent(agentId)}` +
+      `/state/value/${encodeURIComponent(key)}`;
+    return (await this.client.request({ method: 'GET', path })) as Record<string, unknown>;
+  }
+
+  /**
+   * GET /api/pulse/iq/agents/{id}/state/scan — paginated range scan.
+   *
+   * Returns the raw response dict. Inspect `truncated` to decide if more
+   * data exists; paginate by setting `start` on the next call to the last
+   * returned key plus a sentinel suffix.
+   *
+   * @throws PulseNotFoundError when the agent is not queryable.
+   */
+  public async scan(
+    agentId: string,
+    options: IQScanOptions = {},
+  ): Promise<Record<string, unknown>> {
+    const path =
+      `/api/pulse/iq/agents/${encodeURIComponent(agentId)}/state/scan` +
+      buildIQScanQuery(options);
+    return (await this.client.request({ method: 'GET', path })) as Record<string, unknown>;
+  }
+
+  /** GET /api/pulse/iq/agents/{id}/state/keys — keys-only range scan. */
+  public async listKeys(
+    agentId: string,
+    options: IQScanOptions = {},
+  ): Promise<Record<string, unknown>> {
+    const path =
+      `/api/pulse/iq/agents/${encodeURIComponent(agentId)}/state/keys` +
+      buildIQScanQuery(options);
+    return (await this.client.request({ method: 'GET', path })) as Record<string, unknown>;
+  }
+
+  /**
+   * POST /api/pulse/iq/agents/{id}/state/query — filtered / projected / grouped query.
+   *
+   * When `options.groupBy` is set, the response shape is
+   * `{groups: [{groupKey, count}], groupCount, ...}` instead of
+   * `{entries: [...], count, ...}`.
+   *
+   * @throws PulseValidationError on invalid filter syntax (HTTP 400).
+   * @throws PulseNotFoundError when the agent is not queryable.
+   */
+  public async query(
+    agentId: string,
+    options: IQQueryOptions = {},
+  ): Promise<Record<string, unknown>> {
+    const path = `/api/pulse/iq/agents/${encodeURIComponent(agentId)}/state/query`;
+    // Only include keys the caller actually set so we don't lock the
+    // server into echoing defaults that aren't part of the request.
+    const body: Record<string, unknown> = {};
+    if (options.start !== undefined) body.start = options.start;
+    if (options.end !== undefined) body.end = options.end;
+    if (options.limit !== undefined) body.limit = options.limit;
+    if (options.filter !== undefined) body.filter = options.filter;
+    if (options.projection !== undefined) body.projection = options.projection;
+    if (options.groupBy !== undefined) body.groupBy = options.groupBy;
+    return (await this.client.request({
+      method: 'POST',
+      path,
+      body: Object.keys(body).length > 0 ? body : undefined,
+    })) as Record<string, unknown>;
+  }
+}
+
+/**
+ * Builds the `?start=&end=&limit=N` query suffix for IQ scan / list-keys.
+ * `limit` is always sent (default 100). Missing start/end are omitted so
+ * the URL stays clean.
+ */
+function buildIQScanQuery(options: IQScanOptions): string {
+  const params = new URLSearchParams();
+  params.set('limit', String(options.limit ?? 100));
+  if (options.start !== undefined) params.set('start', options.start);
+  if (options.end !== undefined) params.set('end', options.end);
+  return `?${params.toString()}`;
 }

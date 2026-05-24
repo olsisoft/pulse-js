@@ -1,6 +1,6 @@
 {
   "name": "@olsisoft/pulse-client",
-  "version": "2.5.8",
+  "version": "2.6.0",
   "description": "Official JavaScript / TypeScript client for StreamFlow Pulse — AI Agent Platform",
   "keywords": [
     "pulse",
@@ -21,7 +21,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/olsisoft/pulse-js.git"
+    "url": "git+https://github.com/olsisoft/streamflow.git",
+    "directory": "pulse-js"
   },
   "type": "module",
   "main": "./dist/index.cjs",
