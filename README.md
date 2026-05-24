@@ -1,6 +1,6 @@
 # @olsisoft/pulse-client — JavaScript / TypeScript SDK for StreamFlow Pulse
 
-Official client for the [Pulse](https://github.com/olsisoft/streamflow) AI Agent Platform.
+Official client for the [Pulse](https://github.com/olsisoft/pulse-js) AI Agent Platform.
 
 ```ts
 import { PulseClient } from '@olsisoft/pulse-client';
@@ -156,8 +156,8 @@ const client = new PulseClient({
 ## Development
 
 ```bash
-git clone https://github.com/olsisoft/streamflow.git
-cd streamflow/pulse-js
+git clone https://github.com/olsisoft/pulse-js.git
+cd pulse-js
 
 npm install
 npm run typecheck    # tsc --noEmit
