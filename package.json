@@ -12,8 +12,8 @@
     "mcp",
     "sdk"
   ],
-  "homepage": "https://github.com/olsisoft/streamflow",
-  "bugs": "https://github.com/olsisoft/streamflow/issues",
+  "homepage": "https://github.com/olsisoft/pulse-js",
+  "bugs": "https://github.com/olsisoft/pulse-js/issues",
   "license": "Apache-2.0",
   "author": {
     "name": "Njong Michael",
@@ -21,8 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/olsisoft/streamflow.git",
-    "directory": "pulse-js"
+    "url": "git+https://github.com/olsisoft/pulse-js.git"
   },
   "type": "module",
   "main": "./dist/index.cjs",

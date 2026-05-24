@@ -1,7 +1,7 @@
 # Contributing to pulse-js
 
 This repository is **a synchronised mirror** of `pulse-js/` in the
-[streamflow monorepo](https://github.com/olsisoft/streamflow).
+[streamflow monorepo](https://github.com/olsisoft/pulse-js).
 
 Open issues + pull requests against the monorepo, not against this
 repo. The sync workflow lifts code from there into here on every
