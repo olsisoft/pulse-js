@@ -67,7 +67,7 @@ for (const agent of await client.agents.list()) {
 }
 ```
 
-## Supported surfaces (v2.5.8)
+## Supported surfaces (v2.6.0)
 
 | Resource | Methods | Notes |
 |---|---|---|
