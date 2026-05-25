@@ -10,6 +10,7 @@
  * endpoint lands in the spec, add a method here and a matching test.
  */
 
+import { DuplexChannel, type DuplexOptions, deriveWsUrl } from './duplex.js';
 import {
   PulseAPIError,
   PulseAuthError,
@@ -75,6 +76,7 @@ export class PulseClient {
   public readonly events: EventsResource;
   public readonly iq: IQResource;
   public readonly streams: StreamsResource;
+  public readonly models: ModelsResource;
 
   constructor(options: PulseClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, '');
@@ -94,6 +96,37 @@ export class PulseClient {
     this.events = new EventsResource(this);
     this.iq = new IQResource(this);
     this.streams = new StreamsResource(this);
+    this.models = new ModelsResource(this);
+  }
+
+  /**
+   * B-114 — open a bidirectional duplex channel to an agent.
+   *
+   * Returns a {@link DuplexChannel} that streams events IN and receives the
+   * agent's correlated outputs OUT on a single WebSocket — the
+   * synchronous-decision path (fraud, pricing, A/B assignment). Resolves once
+   * the server's `connected` frame arrives (an `error` frame on open is
+   * surfaced as a thrown {@link PulseAPIError}).
+   *
+   * The endpoint runs on the Pulse WebSocket port (REST port + 1); pass
+   * `options.wsUrl` to override the derived URL.
+   *
+   * @example
+   * ```ts
+   * const ch = await client.duplex('fraud-detector');
+   * const cid = await ch.send({ amount: 5000 }, 'tx-1');
+   * const signal = await ch.recv();   // signal.correlationId === 'tx-1'
+   * await ch.close();
+   * ```
+   */
+  public async duplex(agentId: string, options: DuplexOptions = {}): Promise<DuplexChannel> {
+    if (typeof agentId !== 'string' || !agentId.trim()) {
+      throw new PulseClientError('agentId must be a non-empty string');
+    }
+    const url = options.wsUrl ?? deriveWsUrl(this.baseUrl, agentId, this.token);
+    const channel = new DuplexChannel(url);
+    await channel.open();
+    return channel;
   }
 
   /** @internal — exposed so EventsResource can build its SSE URL. */
@@ -113,6 +146,50 @@ export class PulseClient {
       path: '/api/pulse/version',
       authenticated: false,
     })) as Record<string, unknown>;
+  }
+
+  /**
+   * @internal — multipart/form-data POST, used by {@link ModelsResource.upload}.
+   *
+   * Lets the platform `fetch` set the `Content-Type` (with the generated
+   * boundary) itself — we must NOT set it manually or the boundary is lost.
+   */
+  public async requestMultipart(path: string, form: FormData): Promise<unknown> {
+    const headers: Record<string, string> = { 'User-Agent': USER_AGENT };
+    if (!this.token) {
+      throw new PulseAuthError(401, path, {
+        error: 'No token set. Call client.auth.login() first or pass options.token.',
+      });
+    }
+    headers['Authorization'] = `Bearer ${this.token}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    let response: Response;
+    try {
+      response = await this.fetchImpl(`${this.baseUrl}${path}`, {
+        method: 'POST',
+        headers,
+        body: form,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response.status === 204) return undefined;
+    if (response.status >= 200 && response.status < 300) {
+      const text = await response.text();
+      if (!text) return undefined;
+      try {
+        return JSON.parse(text);
+      } catch {
+        return text;
+      }
+    }
+    await this.raiseForError(response, path);
+    throw new PulseAPIError(response.status, path);
   }
 
   /** @internal — used by resource classes; intentionally not part of the public surface. */
@@ -394,6 +471,130 @@ export class TemplatesResource extends Resource {
     })) as Record<string, unknown>;
     const templates = result?.templates;
     return Array.isArray(templates) ? (templates as Record<string, unknown>[]) : [];
+  }
+}
+
+/** Options passed to {@link ModelsResource.upload}. */
+export interface ModelUploadOptions {
+  /** Model name referenced by `mlPredict({ model })`. */
+  name: string;
+  /** Raw model bytes (alternative to {@link path}). */
+  data?: Uint8Array | Buffer;
+  /** Filesystem path to the `.onnx` file (alternative to {@link data}). */
+  path?: string;
+  /** Model runtime — only `'onnx'` is supported today. Default `'onnx'`. */
+  runtime?: string;
+  /** Ordered feature-name → type map, used to pack the input tensor. */
+  inputSchema?: Record<string, string>;
+  /** Output-name → type map (informational). */
+  outputSchema?: Record<string, string>;
+}
+
+/**
+ * client.models — B-112 embedded ML model registry.
+ *
+ * Upload ONNX models that the streaming {@link StreamBuilder.mlPredict}
+ * operator scores events against, in-process on the Pulse engine (no
+ * model-server hop). Models are org-scoped; upload / delete require the
+ * ADMIN role.
+ *
+ * @example
+ * ```ts
+ * await client.models.upload({
+ *   name: 'fraud-classifier',
+ *   path: './model.onnx',
+ *   inputSchema: { amount: 'float', country: 'string' },
+ *   outputSchema: { fraud_score: 'float', label: 'string' },
+ * });
+ * ```
+ */
+export class ModelsResource extends Resource {
+  /**
+   * POST /api/pulse/ml-models — upload (or replace) a model as
+   * multipart/form-data. Supply the model either by `data` bytes or file
+   * `path` (exactly one). Replacing an existing name hot-swaps the model with
+   * no agent restart. Returns the persisted model metadata.
+   */
+  public async upload(options: ModelUploadOptions): Promise<Record<string, unknown>> {
+    if (typeof options.name !== 'string' || !options.name.trim()) {
+      throw new PulseClientError('name must be a non-empty string');
+    }
+    const hasData = options.data !== undefined;
+    const hasPath = options.path !== undefined;
+    if (hasData === hasPath) {
+      throw new PulseClientError("provide exactly one of 'path' or 'data'");
+    }
+
+    let blob: Uint8Array;
+    let filename: string;
+    if (hasPath) {
+      const { readFile } = await import('node:fs/promises');
+      blob = await readFile(options.path as string);
+      filename = (options.path as string).split('/').pop() ?? `${options.name}.onnx`;
+    } else {
+      blob = options.data as Uint8Array;
+      filename = `${options.name}.onnx`;
+    }
+    if (blob.length === 0) {
+      throw new PulseClientError('model bytes are empty');
+    }
+
+    const runtime = options.runtime ?? 'onnx';
+    const form = new FormData();
+    form.append('name', options.name);
+    form.append('runtime', runtime);
+    if (options.inputSchema !== undefined) {
+      form.append('inputSchema', JSON.stringify(options.inputSchema));
+    }
+    if (options.outputSchema !== undefined) {
+      form.append('outputSchema', JSON.stringify(options.outputSchema));
+    }
+    // Copy into a fresh ArrayBuffer so Blob gets a clean, exactly-sized buffer
+    // regardless of any Buffer pooling / view offset on the input.
+    const bytes = new Uint8Array(blob.length);
+    bytes.set(blob);
+    form.append(
+      'model',
+      new Blob([bytes], { type: 'application/octet-stream' }),
+      filename,
+    );
+
+    return (await this.client.requestMultipart(
+      '/api/pulse/ml-models',
+      form,
+    )) as Record<string, unknown>;
+  }
+
+  /** GET /api/pulse/ml-models — models registered for the caller's org. */
+  public async list(): Promise<Record<string, unknown>[]> {
+    const result = (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/ml-models',
+    })) as Record<string, unknown>;
+    const models = result?.models;
+    return Array.isArray(models) ? (models as Record<string, unknown>[]) : [];
+  }
+
+  /** GET /api/pulse/ml-models/{name} — metadata for one model. */
+  public async get(name: string): Promise<Record<string, unknown>> {
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new PulseClientError('name must be a non-empty string');
+    }
+    return (await this.client.request({
+      method: 'GET',
+      path: `/api/pulse/ml-models/${encodeURIComponent(name)}`,
+    })) as Record<string, unknown>;
+  }
+
+  /** DELETE /api/pulse/ml-models/{name} — remove a model (ADMIN). */
+  public async delete(name: string): Promise<void> {
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new PulseClientError('name must be a non-empty string');
+    }
+    await this.client.request({
+      method: 'DELETE',
+      path: `/api/pulse/ml-models/${encodeURIComponent(name)}`,
+    });
   }
 }
 

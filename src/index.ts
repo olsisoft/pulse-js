@@ -24,6 +24,8 @@ export {
   type IQQueryOptions,
   IQResource,
   type IQScanOptions,
+  type ModelUploadOptions,
+  ModelsResource,
   PipelinesResource,
   PulseClient,
   type PulseClientOptions,
@@ -31,6 +33,13 @@ export {
   TemplatesResource,
   UsersResource,
 } from './client.js';
+
+export {
+  DuplexChannel,
+  type DuplexOptions,
+  type DuplexOutput,
+  deriveWsUrl,
+} from './duplex.js';
 
 export {
   PulseAPIError,
@@ -50,8 +59,12 @@ export {
   type CepOptions,
   type EnrichAsyncOptions,
   type EnrichOptions,
+  type ExtractOptions,
   type FromTopicOptions,
+  type MapLlmOptions,
   type MapOptions,
+  type McpCallOptions,
+  type MlPredictOptions,
   StreamBuilder,
   type StreamBuilderOptions,
   StreamsResource,

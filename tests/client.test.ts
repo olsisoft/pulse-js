@@ -12,6 +12,7 @@ import { setupServer } from 'msw/node';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  deriveWsUrl,
   type IQResource,
   PulseAPIError,
   PulseAuthError,
@@ -880,5 +881,129 @@ describe('iq — B-106 Interactive Queries', () => {
   // ---- auth gating ----
   it('summary without token raises PulseAuthError before any HTTP call', async () => {
     await expect(newClient().iq.summary('a1')).rejects.toBeInstanceOf(PulseAuthError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-112 — client.models (embedded ML model registry)
+// ---------------------------------------------------------------------------
+
+describe('client.models', () => {
+  it('upload from bytes sends multipart/form-data', async () => {
+    let contentType: string | null = null;
+    let rawBody = '';
+    server.use(
+      http.post(`${BASE_URL}/api/pulse/ml-models`, async ({ request }) => {
+        contentType = request.headers.get('content-type');
+        rawBody = await request.text();
+        return HttpResponse.json(
+          { name: 'fraud', runtime: 'onnx', version: 1, sizeBytes: 5 },
+          { status: 201 },
+        );
+      }),
+    );
+
+    const meta = await newClient('fake.jwt').models.upload({
+      name: 'fraud',
+      data: new Uint8Array([0x08, 0x09, 0x6f, 0x6e, 0x6e]),
+      inputSchema: { amount: 'float' },
+      outputSchema: { score: 'float' },
+    });
+
+    expect(meta.name).toBe('fraud');
+    expect(contentType).toMatch(/multipart\/form-data/);
+    // The form carries the text fields + the file part named "model".
+    expect(rawBody).toContain('name="name"');
+    expect(rawBody).toContain('fraud');
+    expect(rawBody).toContain('name="runtime"');
+    expect(rawBody).toContain('name="inputSchema"');
+    expect(rawBody).toContain('name="outputSchema"');
+    expect(rawBody).toContain('name="model"');
+  });
+
+  it('upload requires exactly one of data/path', async () => {
+    const client = newClient('fake.jwt');
+    await expect(client.models.upload({ name: 'm' })).rejects.toThrow(/exactly one/);
+    await expect(
+      client.models.upload({ name: 'm', data: new Uint8Array([1]), path: 'x' }),
+    ).rejects.toThrow(/exactly one/);
+  });
+
+  it('upload rejects empty bytes', async () => {
+    await expect(
+      newClient('fake.jwt').models.upload({ name: 'm', data: new Uint8Array(0) }),
+    ).rejects.toThrow(/empty/);
+  });
+
+  it('upload rejects blank name', async () => {
+    await expect(
+      newClient('fake.jwt').models.upload({ name: '  ', data: new Uint8Array([1]) }),
+    ).rejects.toThrow(/name/);
+  });
+
+  it('list unwraps the {models:[...]} envelope', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/ml-models`, () =>
+        HttpResponse.json({ models: [{ name: 'fraud' }] }),
+      ),
+    );
+    const models = await newClient('fake.jwt').models.list();
+    expect(models[0]!.name).toBe('fraud');
+  });
+
+  it('get returns metadata', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/ml-models/fraud`, () =>
+        HttpResponse.json({ name: 'fraud', version: 2 }),
+      ),
+    );
+    const meta = await newClient('fake.jwt').models.get('fraud');
+    expect(meta.version).toBe(2);
+  });
+
+  it('delete issues DELETE', async () => {
+    let called = false;
+    server.use(
+      http.delete(`${BASE_URL}/api/pulse/ml-models/fraud`, () => {
+        called = true;
+        return HttpResponse.json({ deleted: 'fraud' });
+      }),
+    );
+    await newClient('fake.jwt').models.delete('fraud');
+    expect(called).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-114 — duplex WebSocket channel
+// ---------------------------------------------------------------------------
+
+describe('deriveWsUrl', () => {
+  it('http port + 1', () => {
+    expect(deriveWsUrl('http://localhost:9090', 'fraud', undefined)).toBe(
+      'ws://localhost:9091/api/pulse/agents/fraud/duplex',
+    );
+  });
+
+  it('https becomes wss', () => {
+    expect(deriveWsUrl('https://pulse.example.com:8443', 'agent-x', undefined)).toBe(
+      'wss://pulse.example.com:8444/api/pulse/agents/agent-x/duplex',
+    );
+  });
+
+  it('token rides in the query', () => {
+    expect(deriveWsUrl('http://h:9090', 'a', 'jwt.tok en')).toContain(
+      '/api/pulse/agents/a/duplex?token=jwt.tok%20en',
+    );
+  });
+
+  it('agent id is URL-encoded', () => {
+    expect(deriveWsUrl('http://h:9090', 'team/agent', undefined)).toContain(
+      'agents/team%2Fagent/duplex',
+    );
+  });
+
+  it('client.duplex rejects a blank agent id', async () => {
+    await expect(newClient().duplex('  ')).rejects.toThrow(/agentId/);
   });
 });
