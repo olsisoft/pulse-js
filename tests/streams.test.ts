@@ -295,6 +295,114 @@ describe('StreamBuilder operators', () => {
     expect(() => new StreamBuilder().fromTopic('in').cep([])).toThrow(/non-empty sequence/);
   });
 
+  // B-109 map_llm
+  it('mapLlm full shape', () => {
+    const b = new StreamBuilder().fromTopic('in').mapLlm('Summarise: {body}', {
+      outputField: 'summary',
+      model: 'gemma3:7b',
+      temperature: 0.0,
+      maxTokens: 64,
+      parallelism: 8,
+      ordering: 'UNORDERED',
+      onFailure: 'PASS_THROUGH',
+      maxCallsPerSec: 50,
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'mapLlm',
+        prompt: 'Summarise: {body}',
+        outputField: 'summary',
+        model: 'gemma3:7b',
+        temperature: 0.0,
+        maxTokens: 64,
+        parallelism: 8,
+        ordering: 'UNORDERED',
+        onFailure: 'PASS_THROUGH',
+        maxCallsPerSec: 50,
+      },
+    ]);
+  });
+
+  it('mapLlm rejects blank prompt / outputField', () => {
+    expect(() => new StreamBuilder().fromTopic('in').mapLlm('', { outputField: 'x' })).toThrow(
+      /prompt/,
+    );
+    expect(() =>
+      new StreamBuilder().fromTopic('in').mapLlm('p', { outputField: '' }),
+    ).toThrow(/outputField/);
+  });
+
+  // B-109 extract
+  it('extract full shape', () => {
+    const b = new StreamBuilder().fromTopic('in').extract({
+      instruction: 'Extract intent and urgency',
+      schema: { intent: 'string', urgency: 'int' },
+      model: 'gemma3:7b',
+      temperature: 0.0,
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'extract',
+        instruction: 'Extract intent and urgency',
+        schema: { intent: 'string', urgency: 'int' },
+        model: 'gemma3:7b',
+        temperature: 0.0,
+      },
+    ]);
+  });
+
+  it('extract rejects empty schema', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').extract({ instruction: 'x', schema: {} }),
+    ).toThrow(/schema/);
+  });
+
+  // B-109 Phase 2 mcp_call
+  it('mcpCall full shape', () => {
+    const b = new StreamBuilder().fromTopic('in').mcpCall('crm.lookup_customer', {
+      args: { customer_id: '{customerId}' },
+      outputField: 'customer',
+      parallelism: 4,
+      ordering: 'UNORDERED',
+      onFailure: 'EMIT_ERROR',
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'mcpCall',
+        tool: 'crm.lookup_customer',
+        args: { customer_id: '{customerId}' },
+        outputField: 'customer',
+        parallelism: 4,
+        ordering: 'UNORDERED',
+        onFailure: 'EMIT_ERROR',
+      },
+    ]);
+  });
+
+  it('mcpCall minimal fire-and-forget', () => {
+    const b = new StreamBuilder().fromTopic('in').mcpCall('pagerduty.create_incident');
+    expect(b.operators()).toEqual([{ type: 'mcpCall', tool: 'pagerduty.create_incident' }]);
+  });
+
+  it('mcpCall rejects blank tool', () => {
+    expect(() => new StreamBuilder().fromTopic('in').mcpCall('')).toThrow(/tool/);
+  });
+
+  it('LLM/MCP operators chain with others', () => {
+    const b = new StreamBuilder()
+      .fromTopic('tickets')
+      .mapLlm('Summarise: {body}', { outputField: 'summary' })
+      .extract({ instruction: 'Classify', schema: { urgency: 'int' } })
+      .filter('urgency >= 4')
+      .mcpCall('pagerduty.create_incident', { args: { title: '{summary}' } });
+    expect(b.operators().map((o) => o.type)).toEqual([
+      'mapLlm',
+      'extract',
+      'filter',
+      'mcpCall',
+    ]);
+  });
+
   it('broadcastJoin full shape', () => {
     const b = new StreamBuilder().fromTopic('in').broadcastJoin({
       joinKeyField: 'userId',
