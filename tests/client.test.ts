@@ -12,6 +12,7 @@ import { setupServer } from 'msw/node';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  deriveWsUrl,
   type IQResource,
   PulseAPIError,
   PulseAuthError,
@@ -576,6 +577,73 @@ describe('events.stream() — B-098 Phase 7 SSE', () => {
   });
 });
 
+describe('events.replay() — B-113 time-travel change replay', () => {
+  it('unwraps the changes list and sends from/to/limit', async () => {
+    let observedQS = '';
+    server.use(
+      http.get(
+        `${BASE_URL}/api/pulse/iq/agents/user-sessions/state/replay/u42`,
+        ({ request }) => {
+          observedQS = new URL(request.url).search;
+          return HttpResponse.json({
+            agentId: 'user-sessions',
+            key: 'u42',
+            count: 2,
+            changes: [
+              { timestamp: 1000, changeType: 'PUT', value: { v: 1 } },
+              { timestamp: 2000, changeType: 'PUT', value: { v: 2 } },
+            ],
+          });
+        },
+      ),
+    );
+    const changes = await newClient('fake.jwt').events.replay({
+      affectingState: 'user-sessions',
+      key: 'u42',
+      from: '2026-05-24T10:00:00Z',
+      to: '2026-05-24T11:00:00Z',
+    });
+    expect(Array.isArray(changes)).toBe(true);
+    expect(changes).toHaveLength(2);
+    expect(changes[0].changeType).toBe('PUT');
+    const params = new URLSearchParams(observedQS);
+    expect(params.get('from')).toBe('2026-05-24T10:00:00Z');
+    expect(params.get('to')).toBe('2026-05-24T11:00:00Z');
+    expect(params.get('limit')).toBe('100');
+  });
+
+  it('defaults from=-1h, to=now, limit=100 and returns [] when changes absent', async () => {
+    let observedQS = '';
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/iq/agents/a1/state/replay/k1`, ({ request }) => {
+        observedQS = new URL(request.url).search;
+        return HttpResponse.json({ agentId: 'a1', key: 'k1', count: 0 });
+      }),
+    );
+    const changes = await newClient('fake.jwt').events.replay({
+      affectingState: 'a1',
+      key: 'k1',
+    });
+    expect(changes).toEqual([]);
+    const params = new URLSearchParams(observedQS);
+    expect(params.get('from')).toBe('-1h');
+    expect(params.get('to')).toBe('now');
+    expect(params.get('limit')).toBe('100');
+  });
+
+  it('respects a custom limit', async () => {
+    let observedQS = '';
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/iq/agents/a1/state/replay/k1`, ({ request }) => {
+        observedQS = new URL(request.url).search;
+        return HttpResponse.json({ agentId: 'a1', key: 'k1', count: 0, changes: [] });
+      }),
+    );
+    await newClient('fake.jwt').events.replay({ affectingState: 'a1', key: 'k1', limit: 25 });
+    expect(new URLSearchParams(observedQS).get('limit')).toBe('25');
+  });
+});
+
 describe('iq — B-106 Interactive Queries', () => {
   // ---- summary ----
   it('summary returns state metadata', async () => {
@@ -714,6 +782,75 @@ describe('iq — B-106 Interactive Queries', () => {
       const body = (err as PulseNotFoundError).body as Record<string, unknown>;
       expect(body.reason).toBe('non-streaming or stopped');
     }
+  });
+
+  // ---- B-113 time-travel: as_of / diff ----
+  it('get as_of sends param and returns past value', async () => {
+    let observedQS = '';
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/iq/agents/sessions/state/value/u42`, ({ request }) => {
+        observedQS = new URL(request.url).search;
+        return HttpResponse.json({
+          agentId: 'sessions',
+          key: 'u42',
+          value: { pages: 1 },
+          asOf: 1716559920000,
+        });
+      }),
+    );
+    const result = await newClient('fake.jwt').iq.get('sessions', 'u42', { asOf: '-1h' });
+    expect((result.value as { pages: number }).pages).toBe(1);
+    expect(result.asOf).toBe(1716559920000);
+    expect(new URLSearchParams(observedQS).get('as_of')).toBe('-1h');
+  });
+
+  it('get without as_of sends no query param', async () => {
+    let observedQS = '?unset';
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/iq/agents/a1/state/value/k1`, ({ request }) => {
+        observedQS = new URL(request.url).search;
+        return HttpResponse.json({ agentId: 'a1', key: 'k1', value: 1 });
+      }),
+    );
+    await newClient('fake.jwt').iq.get('a1', 'k1');
+    expect(observedQS).toBe('');
+  });
+
+  it('diff sends from/to and returns changes', async () => {
+    let observedQS = '';
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/iq/agents/sessions/state/diff/u42`, ({ request }) => {
+        observedQS = new URL(request.url).search;
+        return HttpResponse.json({
+          agentId: 'sessions',
+          key: 'u42',
+          changes: { cart_value: { delta: 70, from: 0, to: 70 } },
+        });
+      }),
+    );
+    const result = await newClient('fake.jwt').iq.diff('sessions', 'u42', {
+      from: '-1h',
+      to: 'now',
+    });
+    const changes = result.changes as { cart_value: { delta: number } };
+    expect(changes.cart_value.delta).toBe(70);
+    const params = new URLSearchParams(observedQS);
+    expect(params.get('from')).toBe('-1h');
+    expect(params.get('to')).toBe('now');
+  });
+
+  it('diff defaults from=-1h and to=now', async () => {
+    let observedQS = '';
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/iq/agents/a1/state/diff/k1`, ({ request }) => {
+        observedQS = new URL(request.url).search;
+        return HttpResponse.json({ agentId: 'a1', key: 'k1', changes: {} });
+      }),
+    );
+    await newClient('fake.jwt').iq.diff('a1', 'k1');
+    const params = new URLSearchParams(observedQS);
+    expect(params.get('from')).toBe('-1h');
+    expect(params.get('to')).toBe('now');
   });
 
   // ---- scan ----
@@ -880,5 +1017,157 @@ describe('iq — B-106 Interactive Queries', () => {
   // ---- auth gating ----
   it('summary without token raises PulseAuthError before any HTTP call', async () => {
     await expect(newClient().iq.summary('a1')).rejects.toBeInstanceOf(PulseAuthError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-112 — client.models (embedded ML model registry)
+// ---------------------------------------------------------------------------
+
+describe('client.models', () => {
+  it('upload from bytes sends multipart/form-data', async () => {
+    let contentType: string | null = null;
+    let rawBody = '';
+    server.use(
+      http.post(`${BASE_URL}/api/pulse/ml-models`, async ({ request }) => {
+        contentType = request.headers.get('content-type');
+        rawBody = await request.text();
+        return HttpResponse.json(
+          { name: 'fraud', runtime: 'onnx', version: 1, sizeBytes: 5 },
+          { status: 201 },
+        );
+      }),
+    );
+
+    const meta = await newClient('fake.jwt').models.upload({
+      name: 'fraud',
+      data: new Uint8Array([0x08, 0x09, 0x6f, 0x6e, 0x6e]),
+      inputSchema: { amount: 'float' },
+      outputSchema: { score: 'float' },
+    });
+
+    expect(meta.name).toBe('fraud');
+    expect(contentType).toMatch(/multipart\/form-data/);
+    // The form carries the text fields + the file part named "model".
+    expect(rawBody).toContain('name="name"');
+    expect(rawBody).toContain('fraud');
+    expect(rawBody).toContain('name="runtime"');
+    expect(rawBody).toContain('name="inputSchema"');
+    expect(rawBody).toContain('name="outputSchema"');
+    expect(rawBody).toContain('name="model"');
+  });
+
+  it('upload requires exactly one of data/path', async () => {
+    const client = newClient('fake.jwt');
+    await expect(client.models.upload({ name: 'm' })).rejects.toThrow(/exactly one/);
+    await expect(
+      client.models.upload({ name: 'm', data: new Uint8Array([1]), path: 'x' }),
+    ).rejects.toThrow(/exactly one/);
+  });
+
+  it('upload rejects empty bytes', async () => {
+    await expect(
+      newClient('fake.jwt').models.upload({ name: 'm', data: new Uint8Array(0) }),
+    ).rejects.toThrow(/empty/);
+  });
+
+  it('upload rejects blank name', async () => {
+    await expect(
+      newClient('fake.jwt').models.upload({ name: '  ', data: new Uint8Array([1]) }),
+    ).rejects.toThrow(/name/);
+  });
+
+  it('list unwraps the {models:[...]} envelope', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/ml-models`, () =>
+        HttpResponse.json({ models: [{ name: 'fraud' }] }),
+      ),
+    );
+    const models = await newClient('fake.jwt').models.list();
+    expect(models[0]!.name).toBe('fraud');
+  });
+
+  it('get returns metadata', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/ml-models/fraud`, () =>
+        HttpResponse.json({ name: 'fraud', version: 2 }),
+      ),
+    );
+    const meta = await newClient('fake.jwt').models.get('fraud');
+    expect(meta.version).toBe(2);
+  });
+
+  it('delete issues DELETE', async () => {
+    let called = false;
+    server.use(
+      http.delete(`${BASE_URL}/api/pulse/ml-models/fraud`, () => {
+        called = true;
+        return HttpResponse.json({ deleted: 'fraud' });
+      }),
+    );
+    await newClient('fake.jwt').models.delete('fraud');
+    expect(called).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-114 — duplex WebSocket channel
+// ---------------------------------------------------------------------------
+
+describe('deriveWsUrl', () => {
+  it('http port + 1', () => {
+    expect(deriveWsUrl('http://localhost:9090', 'fraud', undefined)).toBe(
+      'ws://localhost:9091/api/pulse/agents/fraud/duplex',
+    );
+  });
+
+  it('https becomes wss', () => {
+    expect(deriveWsUrl('https://pulse.example.com:8443', 'agent-x', undefined)).toBe(
+      'wss://pulse.example.com:8444/api/pulse/agents/agent-x/duplex',
+    );
+  });
+
+  it('token rides in the query', () => {
+    expect(deriveWsUrl('http://h:9090', 'a', 'jwt.tok en')).toContain(
+      '/api/pulse/agents/a/duplex?token=jwt.tok%20en',
+    );
+  });
+
+  it('agent id is URL-encoded', () => {
+    expect(deriveWsUrl('http://h:9090', 'team/agent', undefined)).toContain(
+      'agents/team%2Fagent/duplex',
+    );
+  });
+
+  it('client.duplex rejects a blank agent id', async () => {
+    await expect(newClient().duplex('  ')).rejects.toThrow(/agentId/);
+  });
+});
+
+describe('client.connectors (B-093 follow-up — catalogue parity)', () => {
+  it('list() returns sinks and sources', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/connectors`, () =>
+        HttpResponse.json({
+          sinks: [{ subType: 'segment', displayName: 'Segment', configFields: [] }],
+          sources: [{ subType: 'posthog-source', displayName: 'PostHog Source (poll)', configFields: [] }],
+        })
+      )
+    );
+    const client = newClient('jwt');
+    const catalog = await client.connectors.list();
+    expect((catalog.sinks as Record<string, unknown>[])[0].subType).toBe('segment');
+    expect((catalog.sources as Record<string, unknown>[])[0].subType).toBe('posthog-source');
+  });
+
+  it('sinks() / sources() helpers and empty-key degrade', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/connectors`, () =>
+        HttpResponse.json({ sinks: [{ subType: 'amplitude' }] })
+      )
+    );
+    const client = newClient('jwt');
+    expect((await client.connectors.sinks())[0].subType).toBe('amplitude');
+    expect(await client.connectors.sources()).toEqual([]); // missing key -> []
   });
 });
