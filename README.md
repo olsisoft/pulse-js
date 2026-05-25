@@ -80,6 +80,28 @@ for (const agent of await client.agents.list()) {
 
 The full ~112-endpoint surface is documented in the OpenAPI spec at `<pulse-server>/api-docs`. SDK methods for the rest land opportunistically as user-facing demand surfaces.
 
+## Embedded ML inference & duplex
+
+Score events with an uploaded ONNX model in-process (B-112), and open a
+bidirectional duplex channel for synchronous decisions (B-114). Full guide:
+[ML inference & duplex](https://github.com/olsisoft/pulse-js/blob/dev/docs/SDK-ML-INFERENCE-AND-DUPLEX.md).
+
+```ts
+// Upload + score with an ONNX model (no model-server hop)
+await client.models.upload({ name: 'fraud', path: './fraud.onnx',
+  inputSchema: { amount: 'float', country: 'float' } });
+builder.fromTopic('transactions')
+  .mlPredict({ model: 'fraud', inputFields: ['amount', 'country'], outputField: 'prediction' })
+  .filter('prediction.fraud_score > 0.8').toTopic('flagged');
+
+// Duplex: one connection, send in / receive the correlated output
+// (global WebSocket on Node 22+/browsers; `npm i ws` on Node < 22)
+const ch = await client.duplex('fraud-detector');
+await ch.send({ amount: 5000 }, 'tx-1');
+const signal = await ch.recv();   // signal.correlationId === 'tx-1'
+await ch.close();
+```
+
 ## Authentication
 
 ```ts
