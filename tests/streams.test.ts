@@ -295,6 +295,196 @@ describe('StreamBuilder operators', () => {
     expect(() => new StreamBuilder().fromTopic('in').cep([])).toThrow(/non-empty sequence/);
   });
 
+  // B-109 map_llm
+  it('mapLlm full shape', () => {
+    const b = new StreamBuilder().fromTopic('in').mapLlm('Summarise: {body}', {
+      outputField: 'summary',
+      model: 'gemma3:7b',
+      temperature: 0.0,
+      maxTokens: 64,
+      parallelism: 8,
+      ordering: 'UNORDERED',
+      onFailure: 'PASS_THROUGH',
+      maxCallsPerSec: 50,
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'mapLlm',
+        prompt: 'Summarise: {body}',
+        outputField: 'summary',
+        model: 'gemma3:7b',
+        temperature: 0.0,
+        maxTokens: 64,
+        parallelism: 8,
+        ordering: 'UNORDERED',
+        onFailure: 'PASS_THROUGH',
+        maxCallsPerSec: 50,
+      },
+    ]);
+  });
+
+  it('mapLlm rejects blank prompt / outputField', () => {
+    expect(() => new StreamBuilder().fromTopic('in').mapLlm('', { outputField: 'x' })).toThrow(
+      /prompt/,
+    );
+    expect(() =>
+      new StreamBuilder().fromTopic('in').mapLlm('p', { outputField: '' }),
+    ).toThrow(/outputField/);
+  });
+
+  // B-109 extract
+  it('extract full shape', () => {
+    const b = new StreamBuilder().fromTopic('in').extract({
+      instruction: 'Extract intent and urgency',
+      schema: { intent: 'string', urgency: 'int' },
+      model: 'gemma3:7b',
+      temperature: 0.0,
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'extract',
+        instruction: 'Extract intent and urgency',
+        schema: { intent: 'string', urgency: 'int' },
+        model: 'gemma3:7b',
+        temperature: 0.0,
+      },
+    ]);
+  });
+
+  it('extract rejects empty schema', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').extract({ instruction: 'x', schema: {} }),
+    ).toThrow(/schema/);
+  });
+
+  // B-109 Phase 2 mcp_call
+  it('mcpCall full shape', () => {
+    const b = new StreamBuilder().fromTopic('in').mcpCall('crm.lookup_customer', {
+      args: { customer_id: '{customerId}' },
+      outputField: 'customer',
+      parallelism: 4,
+      ordering: 'UNORDERED',
+      onFailure: 'EMIT_ERROR',
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'mcpCall',
+        tool: 'crm.lookup_customer',
+        args: { customer_id: '{customerId}' },
+        outputField: 'customer',
+        parallelism: 4,
+        ordering: 'UNORDERED',
+        onFailure: 'EMIT_ERROR',
+      },
+    ]);
+  });
+
+  it('mcpCall minimal fire-and-forget', () => {
+    const b = new StreamBuilder().fromTopic('in').mcpCall('pagerduty.create_incident');
+    expect(b.operators()).toEqual([{ type: 'mcpCall', tool: 'pagerduty.create_incident' }]);
+  });
+
+  it('mcpCall rejects blank tool', () => {
+    expect(() => new StreamBuilder().fromTopic('in').mcpCall('')).toThrow(/tool/);
+  });
+
+  it('LLM/MCP operators chain with others', () => {
+    const b = new StreamBuilder()
+      .fromTopic('tickets')
+      .mapLlm('Summarise: {body}', { outputField: 'summary' })
+      .extract({ instruction: 'Classify', schema: { urgency: 'int' } })
+      .filter('urgency >= 4')
+      .mcpCall('pagerduty.create_incident', { args: { title: '{summary}' } });
+    expect(b.operators().map((o) => o.type)).toEqual([
+      'mapLlm',
+      'extract',
+      'filter',
+      'mcpCall',
+    ]);
+  });
+
+  // ── B-112 mlPredict ──────────────────────────────────────────
+  it('mlPredict full shape', () => {
+    const b = new StreamBuilder().fromTopic('transactions').mlPredict({
+      model: 'fraud-classifier',
+      inputFields: ['amount', 'country', 'merchant_category'],
+      outputField: 'prediction',
+      parallelism: 8,
+      ordering: 'UNORDERED',
+      onFailure: 'DROP',
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'mlPredict',
+        model: 'fraud-classifier',
+        inputFields: ['amount', 'country', 'merchant_category'],
+        outputField: 'prediction',
+        parallelism: 8,
+        ordering: 'UNORDERED',
+        onFailure: 'DROP',
+      },
+    ]);
+  });
+
+  it('mlPredict minimal shape', () => {
+    const b = new StreamBuilder()
+      .fromTopic('in')
+      .mlPredict({ model: 'm', inputFields: ['x'], outputField: 'p' });
+    expect(b.operators()).toEqual([
+      { type: 'mlPredict', model: 'm', inputFields: ['x'], outputField: 'p' },
+    ]);
+  });
+
+  it('mlPredict rejects blank model', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').mlPredict({ model: '', inputFields: ['x'], outputField: 'p' }),
+    ).toThrow(/model/);
+  });
+
+  it('mlPredict rejects blank output field', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').mlPredict({ model: 'm', inputFields: ['x'], outputField: '' }),
+    ).toThrow(/outputField/);
+  });
+
+  it('mlPredict rejects empty input fields', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').mlPredict({ model: 'm', inputFields: [], outputField: 'p' }),
+    ).toThrow(/inputFields/);
+  });
+
+  it('mlPredict rejects non-blank input field violation', () => {
+    expect(() =>
+      new StreamBuilder()
+        .fromTopic('in')
+        .mlPredict({ model: 'm', inputFields: ['x', ''], outputField: 'p' }),
+    ).toThrow(/inputFields/);
+  });
+
+  it('mlPredict rejects bad ordering', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').mlPredict({
+        model: 'm',
+        inputFields: ['x'],
+        outputField: 'p',
+        // @ts-expect-error — invalid ordering value rejected at runtime
+        ordering: 'SHUFFLED',
+      }),
+    ).toThrow(/ordering/);
+  });
+
+  it('mlPredict rejects bad onFailure', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').mlPredict({
+        model: 'm',
+        inputFields: ['x'],
+        outputField: 'p',
+        // @ts-expect-error — invalid onFailure value rejected at runtime
+        onFailure: 'RETRY',
+      }),
+    ).toThrow(/onFailure/);
+  });
+
   it('broadcastJoin full shape', () => {
     const b = new StreamBuilder().fromTopic('in').broadcastJoin({
       joinKeyField: 'userId',
@@ -600,5 +790,22 @@ describe('client.streams', () => {
     const b = new StreamBuilder('original').fromTopic('in').filter('x > 0');
     await client.streams.deploy(b, 'renamed');
     expect(receivedBody?.name).toBe('renamed');
+  });
+});
+
+describe('StreamBuilder.toConnector', () => {
+  it('emits a sink node with channel, config, and default topic', () => {
+    const out = new StreamBuilder('pc')
+      .fromTopic('in')
+      .filter('x > 0')
+      .toConnector('segment', { 'segment.write.key': 'wk' })
+      .build();
+    const nodes = out.nodes as Record<string, unknown>[];
+    const sink = nodes[2] as Record<string, unknown>;
+    expect(sink.type).toBe('sink');
+    const cfg = sink.config as Record<string, unknown>;
+    expect(cfg.channel).toBe('segment');
+    expect(cfg.inputTopic).toBe('segment-sink-out');
+    expect(cfg['segment.write.key']).toBe('wk');
   });
 });
