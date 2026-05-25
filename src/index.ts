@@ -19,11 +19,17 @@
 export {
   AgentsResource,
   AuthResource,
+  ConnectorsResource,
+  type EventsReplayOptions,
   EventsResource,
+  type IQDiffOptions,
   type IQFilterExpression,
+  type IQGetOptions,
   type IQQueryOptions,
   IQResource,
   type IQScanOptions,
+  type ModelUploadOptions,
+  ModelsResource,
   PipelinesResource,
   PulseClient,
   type PulseClientOptions,
@@ -31,6 +37,13 @@ export {
   TemplatesResource,
   UsersResource,
 } from './client.js';
+
+export {
+  DuplexChannel,
+  type DuplexOptions,
+  type DuplexOutput,
+  deriveWsUrl,
+} from './duplex.js';
 
 export {
   PulseAPIError,
@@ -50,8 +63,12 @@ export {
   type CepOptions,
   type EnrichAsyncOptions,
   type EnrichOptions,
+  type ExtractOptions,
   type FromTopicOptions,
+  type MapLlmOptions,
   type MapOptions,
+  type McpCallOptions,
+  type MlPredictOptions,
   StreamBuilder,
   type StreamBuilderOptions,
   StreamsResource,
@@ -61,4 +78,4 @@ export {
   windows,
 } from './streams.js';
 
-export const VERSION = '2.6.0';
+export const VERSION = '2.6.1';

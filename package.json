@@ -1,6 +1,6 @@
 {
   "name": "@olsisoft/pulse-client",
-  "version": "2.6.0",
+  "version": "2.6.1",
   "description": "Official JavaScript / TypeScript client for StreamFlow Pulse — AI Agent Platform",
   "keywords": [
     "pulse",
@@ -49,8 +49,12 @@
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build"
   },
+  "optionalDependencies": {
+    "ws": "^8.18.0"
+  },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
     "@typescript-eslint/eslint-plugin": "^8.18.0",
     "@typescript-eslint/parser": "^8.18.0",
     "@vitest/coverage-v8": "^2.1.8",
@@ -58,6 +62,7 @@
     "msw": "^2.6.8",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
+    "ws": "^8.18.0",
     "vitest": "^2.1.8"
   }
 }
