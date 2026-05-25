@@ -272,6 +272,37 @@ export interface CdcJoinOptions {
   stateBackend?: string;
 }
 
+/** B-109 — options passed to {@link StreamBuilder.mapLlm}. */
+export interface MapLlmOptions {
+  outputField: string;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  parallelism?: number;
+  ordering?: 'PRESERVE_INPUT' | 'UNORDERED';
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+  maxCallsPerSec?: number;
+}
+
+/** B-109 — options passed to {@link StreamBuilder.extract}. */
+export interface ExtractOptions {
+  instruction: string;
+  schema: Record<string, string>;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+}
+
+/** B-109 Phase 2 — options passed to {@link StreamBuilder.mcpCall}. */
+export interface McpCallOptions {
+  args?: Record<string, unknown>;
+  outputField?: string;
+  parallelism?: number;
+  ordering?: 'PRESERVE_INPUT' | 'UNORDERED';
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+}
+
 /** Constructor options for {@link StreamBuilder}. */
 export interface StreamBuilderOptions {
   description?: string;
@@ -459,6 +490,70 @@ export class StreamBuilder {
     };
     if (options?.within !== undefined) op.within = options.within;
     if (options?.name !== undefined) op.name = options.name;
+    this.ops.push(op);
+    return this;
+  }
+
+  /**
+   * B-109 — enrich each event with an LLM completion. `prompt` supports
+   * `{field}` placeholders (and `{__payload__}`) substituted from the event
+   * server-side; the completion text lands on the event under `outputField`.
+   */
+  public mapLlm(prompt: string, options: MapLlmOptions): this {
+    requireNonBlank('prompt', prompt);
+    requireNonBlank('outputField', options.outputField);
+    const op: Record<string, unknown> = {
+      type: 'mapLlm',
+      prompt,
+      outputField: options.outputField,
+    };
+    if (options.model !== undefined) op.model = options.model;
+    if (options.temperature !== undefined) op.temperature = options.temperature;
+    if (options.maxTokens !== undefined) op.maxTokens = options.maxTokens;
+    if (options.parallelism !== undefined) op.parallelism = options.parallelism;
+    if (options.ordering !== undefined) op.ordering = options.ordering;
+    if (options.onFailure !== undefined) op.onFailure = options.onFailure;
+    if (options.maxCallsPerSec !== undefined) op.maxCallsPerSec = options.maxCallsPerSec;
+    this.ops.push(op);
+    return this;
+  }
+
+  /**
+   * B-109 — LLM → typed structured fields merged into the event. The LLM is
+   * asked for a JSON object keyed by `schema`'s fields; missing / malformed
+   * fields become `null` server-side (never crashes on a bad response).
+   */
+  public extract(options: ExtractOptions): this {
+    requireNonBlank('instruction', options.instruction);
+    if (!options.schema || Object.keys(options.schema).length === 0) {
+      throw new Error('extract operator requires a non-empty schema');
+    }
+    const op: Record<string, unknown> = {
+      type: 'extract',
+      instruction: options.instruction,
+      schema: { ...options.schema },
+    };
+    if (options.model !== undefined) op.model = options.model;
+    if (options.temperature !== undefined) op.temperature = options.temperature;
+    if (options.maxTokens !== undefined) op.maxTokens = options.maxTokens;
+    if (options.onFailure !== undefined) op.onFailure = options.onFailure;
+    this.ops.push(op);
+    return this;
+  }
+
+  /**
+   * B-109 Phase 2 — invoke an MCP tool per event. `args` string values
+   * support `{field}` substitution. On success the tool output is written to
+   * `outputField` (omit for a fire-and-forget side effect).
+   */
+  public mcpCall(tool: string, options?: McpCallOptions): this {
+    requireNonBlank('tool', tool);
+    const op: Record<string, unknown> = { type: 'mcpCall', tool };
+    if (options?.args !== undefined) op.args = { ...options.args };
+    if (options?.outputField !== undefined) op.outputField = options.outputField;
+    if (options?.parallelism !== undefined) op.parallelism = options.parallelism;
+    if (options?.ordering !== undefined) op.ordering = options.ordering;
+    if (options?.onFailure !== undefined) op.onFailure = options.onFailure;
     this.ops.push(op);
     return this;
   }
