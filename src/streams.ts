@@ -272,6 +272,51 @@ export interface CdcJoinOptions {
   stateBackend?: string;
 }
 
+/** B-109 — options passed to {@link StreamBuilder.mapLlm}. */
+export interface MapLlmOptions {
+  outputField: string;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  parallelism?: number;
+  ordering?: 'PRESERVE_INPUT' | 'UNORDERED';
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+  maxCallsPerSec?: number;
+}
+
+/** B-109 — options passed to {@link StreamBuilder.extract}. */
+export interface ExtractOptions {
+  instruction: string;
+  schema: Record<string, string>;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+}
+
+/** B-109 Phase 2 — options passed to {@link StreamBuilder.mcpCall}. */
+export interface McpCallOptions {
+  args?: Record<string, unknown>;
+  outputField?: string;
+  parallelism?: number;
+  ordering?: 'PRESERVE_INPUT' | 'UNORDERED';
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+}
+
+/** B-112 — options passed to {@link StreamBuilder.mlPredict}. */
+export interface MlPredictOptions {
+  /** Registered model name (see `client.models.upload`). */
+  model: string;
+  /** Feature names pulled from the event, in the model's input order. */
+  inputFields: string[];
+  /** Event field the prediction object is written to. */
+  outputField: string;
+  /** Max concurrent inferences. */
+  parallelism?: number;
+  ordering?: 'PRESERVE_INPUT' | 'UNORDERED';
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+}
+
 /** Constructor options for {@link StreamBuilder}. */
 export interface StreamBuilderOptions {
   description?: string;
@@ -463,6 +508,121 @@ export class StreamBuilder {
     return this;
   }
 
+  /**
+   * B-109 — enrich each event with an LLM completion. `prompt` supports
+   * `{field}` placeholders (and `{__payload__}`) substituted from the event
+   * server-side; the completion text lands on the event under `outputField`.
+   */
+  public mapLlm(prompt: string, options: MapLlmOptions): this {
+    requireNonBlank('prompt', prompt);
+    requireNonBlank('outputField', options.outputField);
+    const op: Record<string, unknown> = {
+      type: 'mapLlm',
+      prompt,
+      outputField: options.outputField,
+    };
+    if (options.model !== undefined) op.model = options.model;
+    if (options.temperature !== undefined) op.temperature = options.temperature;
+    if (options.maxTokens !== undefined) op.maxTokens = options.maxTokens;
+    if (options.parallelism !== undefined) op.parallelism = options.parallelism;
+    if (options.ordering !== undefined) op.ordering = options.ordering;
+    if (options.onFailure !== undefined) op.onFailure = options.onFailure;
+    if (options.maxCallsPerSec !== undefined) op.maxCallsPerSec = options.maxCallsPerSec;
+    this.ops.push(op);
+    return this;
+  }
+
+  /**
+   * B-109 — LLM → typed structured fields merged into the event. The LLM is
+   * asked for a JSON object keyed by `schema`'s fields; missing / malformed
+   * fields become `null` server-side (never crashes on a bad response).
+   */
+  public extract(options: ExtractOptions): this {
+    requireNonBlank('instruction', options.instruction);
+    if (!options.schema || Object.keys(options.schema).length === 0) {
+      throw new Error('extract operator requires a non-empty schema');
+    }
+    const op: Record<string, unknown> = {
+      type: 'extract',
+      instruction: options.instruction,
+      schema: { ...options.schema },
+    };
+    if (options.model !== undefined) op.model = options.model;
+    if (options.temperature !== undefined) op.temperature = options.temperature;
+    if (options.maxTokens !== undefined) op.maxTokens = options.maxTokens;
+    if (options.onFailure !== undefined) op.onFailure = options.onFailure;
+    this.ops.push(op);
+    return this;
+  }
+
+  /**
+   * B-109 Phase 2 — invoke an MCP tool per event. `args` string values
+   * support `{field}` substitution. On success the tool output is written to
+   * `outputField` (omit for a fire-and-forget side effect).
+   */
+  public mcpCall(tool: string, options?: McpCallOptions): this {
+    requireNonBlank('tool', tool);
+    const op: Record<string, unknown> = { type: 'mcpCall', tool };
+    if (options?.args !== undefined) op.args = { ...options.args };
+    if (options?.outputField !== undefined) op.outputField = options.outputField;
+    if (options?.parallelism !== undefined) op.parallelism = options.parallelism;
+    if (options?.ordering !== undefined) op.ordering = options.ordering;
+    if (options?.onFailure !== undefined) op.onFailure = options.onFailure;
+    this.ops.push(op);
+    return this;
+  }
+
+  /**
+   * B-112 — score each event with an embedded ML model. Runs an uploaded ONNX
+   * model in-process on the Pulse engine (no model-server hop). The named
+   * `inputFields` are pulled from the event payload and fed to the model; the
+   * model's output is written as a nested object under `outputField` so
+   * downstream operators can branch on it (e.g.
+   * `.filter('prediction.fraud_score > 0.8')`). Upload the model first with
+   * `client.models.upload`.
+   */
+  public mlPredict(options: MlPredictOptions): this {
+    requireNonBlank('model', options.model);
+    requireNonBlank('outputField', options.outputField);
+    if (
+      !Array.isArray(options.inputFields) ||
+      options.inputFields.length === 0 ||
+      !options.inputFields.every((f) => typeof f === 'string' && f.trim() !== '')
+    ) {
+      throw new Error('inputFields must be a non-empty array of non-blank strings');
+    }
+    if (
+      options.ordering !== undefined &&
+      options.ordering !== 'PRESERVE_INPUT' &&
+      options.ordering !== 'UNORDERED'
+    ) {
+      throw new Error(
+        `ordering must be PRESERVE_INPUT or UNORDERED, got ${JSON.stringify(options.ordering)}`,
+      );
+    }
+    if (
+      options.onFailure !== undefined &&
+      options.onFailure !== 'EMIT_ERROR' &&
+      options.onFailure !== 'DROP' &&
+      options.onFailure !== 'PASS_THROUGH'
+    ) {
+      throw new Error(
+        `onFailure must be EMIT_ERROR, DROP, or PASS_THROUGH, got ${JSON.stringify(options.onFailure)}`,
+      );
+    }
+    const op: Record<string, unknown> = {
+      type: 'mlPredict',
+      model: options.model,
+      inputFields: [...options.inputFields],
+      outputField: options.outputField,
+    };
+    if (options.parallelism !== undefined) op.parallelism = options.parallelism;
+    if (options.ordering !== undefined) op.ordering = options.ordering;
+    if (options.onFailure !== undefined) op.onFailure = options.onFailure;
+    this.ops.push(op);
+    return this;
+  }
+
   /** Broadcast join: enrich the stream against a fully-replicated table. */
   public broadcastJoin(options: BroadcastJoinOptions): this {
     requireNonBlank('joinKeyField', options.joinKeyField);
@@ -506,6 +666,27 @@ export class StreamBuilder {
     this.sinkConfig = { ...(options?.sinkConfig ?? {}) };
     this.sinkLabel = options?.label;
     return this;
+  }
+
+  /**
+   * Terminate the stream in a connector sink (Segment, Kafka, Postgres, …) —
+   * an ergonomic, connector-first alias for
+   * `toTopic(topic, { sinkChannel, sinkConfig })`. `connectorType` is a subType
+   * from `client.connectors.list()`; bridged connectors require the enterprise
+   * bridge JAR on the server. `topic` defaults to `<connectorType>-sink-out`.
+   */
+  public toConnector(
+    connectorType: string,
+    config?: Record<string, unknown>,
+    options?: { topic?: string; label?: string }
+  ): this {
+    requireNonBlank('connectorType', connectorType);
+    const topic = options?.topic ?? `${connectorType}-sink-out`;
+    return this.toTopic(topic, {
+      sinkChannel: connectorType,
+      sinkConfig: config,
+      label: options?.label,
+    });
   }
 
   /**
