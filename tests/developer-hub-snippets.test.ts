@@ -101,8 +101,12 @@ async function execDsl(code: string): Promise<void> {
 }
 
 const SNIPPETS = tsSnippets();
+// Monorepo-only: the developer-hub Markdown lives in streamflow-pulse, which
+// isn't present in the lifted satellite repo — skip the whole suite there
+// (mirrors the Python test's pytest.skip-when-docs-absent behaviour).
+const DOCS_PRESENT = existsSync(DOCS_DIR);
 
-describe('developer-hub TypeScript snippets', () => {
+describe.skipIf(!DOCS_PRESENT)('developer-hub TypeScript snippets', () => {
   it('the docs ship at least one ts snippet', () => {
     expect(SNIPPETS.length).toBeGreaterThan(0);
   });
