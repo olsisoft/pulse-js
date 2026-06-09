@@ -102,6 +102,28 @@ const signal = await ch.recv();   // signal.correlationId === 'tx-1'
 await ch.close();
 ```
 
+## Sandboxed WASM operators
+
+Run an uploaded WebAssembly module over each event (B-110), sandboxed in
+pure-Java Chicory on the engine — no host syscalls, bounded linear memory.
+Any `wasm32` toolchain (Rust, TinyGo, AssemblyScript, C) can author a module
+against the alloc/process ABI; upload / delete require the ADMIN role.
+
+```ts
+// Upload a module, then run it inline in a stream
+await client.wasm.upload({ name: 'pii-redactor', path: './redactor.wasm' });
+builder.fromTopic('events')
+  .wasm({ module: 'pii-redactor', parallelism: 4, onFailure: 'PASS_THROUGH' })
+  .toTopic('clean');
+```
+
+**Legacy formats & protocols — the headline use case.** Compile *any* existing
+parser to `wasm32` and drop it in as a single-message transform to bring legacy
+data into the pipeline — **COBOL copybooks**, FIX, HL7, EDI X12, ASN.1, Modbus, …
+You don't rewrite the parser, you wrap it (see the `pulse-wasm-guest` guest SDK for
+the Rust/TinyGo/AssemblyScript/C operator ABI). Pair it with `.mlPredict()` (ONNX
+above) to parse *and* score each event in-stream, with no external service.
+
 ## Authentication
 
 ```ts
@@ -189,6 +211,37 @@ npm run build        # tsup → dist/ (ESM + CJS + .d.ts)
 ```
 
 CI runs the same on every push touching `pulse-js/` — see `.github/workflows/pulse-js.yaml`.
+
+## Automatic retry (opt-in)
+
+Off by default — one attempt per request. Enable bounded, full-jitter
+exponential-backoff retries via the constructor options:
+
+```ts
+const client = new PulseClient({
+  baseUrl: 'http://localhost:9090',
+  maxRetries: 3, // 0 = off (default)
+});
+```
+
+429 (rate limited) is retried for any method, honouring `Retry-After`;
+`retryOnStatus` 5xx (default `502/503/504`) and transport errors are retried only
+for idempotent methods (GET/HEAD/PUT/DELETE) unless `retryNonIdempotent`; terminal
+4xx are never retried.
+
+## Local pipeline simulation (Python-only today)
+
+The streams DSL is **client-side declaration, server-side execution**:
+`streams.compile(builder)` builds the pipeline JSON locally (no network) and
+`streams.deploy(builder)` runs it on the Pulse engine. This SDK has **no
+in-process simulator** — to validate a pipeline before deploy, `compile()` and
+inspect the JSON, or deploy to a dev Pulse.
+
+> A local `TopologyTestDriver`-style executor that runs a streams pipeline
+> in-process over sample events (`StreamBuilder.simulate(events)`) currently
+> exists **only in the Python SDK** (`streamflow-pulse-client`). Cross-language
+> parity is tracked as **B-169** (issue #311); until then, local simulation is a
+> Python-exclusive capability.
 
 ## Roadmap
 
