@@ -20,6 +20,7 @@ import {
   PulseNotFoundError,
   PulseRateLimitError,
   PulseValidationError,
+  validateWasmModule,
 } from '../src/index.js';
 
 const BASE_URL = 'http://pulse.test:9090';
@@ -1106,6 +1107,199 @@ describe('client.models', () => {
       }),
     );
     await newClient('fake.jwt').models.delete('fraud');
+    expect(called).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-110 — client.wasm (sandboxed WASM module registry)
+// ---------------------------------------------------------------------------
+
+/** Parse a hex string (spaces ignored) into a Uint8Array. */
+function hex(s: string): Uint8Array {
+  const clean = s.replace(/\s+/g, '');
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+// A conforming module: magic + version, then an export section listing
+// alloc / process / memory, no import section.
+const VALID_WASM = hex(
+  '00 61 73 6d 01 00 00 00 ' +
+    '07 1c ' + // export section, size 0x1c (28 bytes payload)
+    '03 ' + // 3 exports
+    '05 61 6c 6c 6f 63 00 00 ' + // "alloc"  kind 0 idx 0
+    '07 70 72 6f 63 65 73 73 00 00 ' + // "process" kind 0 idx 0
+    '06 6d 65 6d 6f 72 79 02 00', // "memory" kind 2 idx 0
+);
+
+// Same exports but preceded by an import section declaring 1 host import.
+const WASM_WITH_IMPORT = hex(
+  '00 61 73 6d 01 00 00 00 ' +
+    '02 09 01 03 65 6e 76 01 66 00 00 ' + // import section: 1 import (env.f)
+    '07 1c 03 05 61 6c 6c 6f 63 00 00 ' +
+    '07 70 72 6f 63 65 73 73 00 00 ' +
+    '06 6d 65 6d 6f 72 79 02 00',
+);
+
+// Export section listing only "alloc" (missing process + memory).
+const WASM_MISSING_EXPORT = hex(
+  '00 61 73 6d 01 00 00 00 ' +
+    '07 09 01 05 61 6c 6c 6f 63 00 00', // export section, 1 export "alloc"
+);
+
+describe('validateWasmModule (B-110 client-side pre-upload validation)', () => {
+  it('accepts a conforming module', () => {
+    expect(() => validateWasmModule(VALID_WASM)).not.toThrow();
+  });
+
+  it('rejects an empty / too-short module', () => {
+    expect(() => validateWasmModule(new Uint8Array(0))).toThrow(PulseValidationError);
+    expect(() => validateWasmModule(new Uint8Array(0))).toThrow(/too short/);
+    expect(() => validateWasmModule(new Uint8Array([0x00, 0x61, 0x73]))).toThrow(/too short/);
+  });
+
+  it('rejects bad magic / version', () => {
+    const bad = hex('de ad be ef 01 00 00 00');
+    expect(() => validateWasmModule(bad)).toThrow(PulseValidationError);
+    expect(() => validateWasmModule(bad)).toThrow(/bad magic\/version/);
+  });
+
+  it('rejects a module that imports host functions', () => {
+    expect(() => validateWasmModule(WASM_WITH_IMPORT)).toThrow(PulseValidationError);
+    expect(() => validateWasmModule(WASM_WITH_IMPORT)).toThrow(/imports host functions/);
+  });
+
+  it('rejects a module missing required exports', () => {
+    expect(() => validateWasmModule(WASM_MISSING_EXPORT)).toThrow(PulseValidationError);
+    expect(() => validateWasmModule(WASM_MISSING_EXPORT)).toThrow(
+      /must export alloc, process and memory/,
+    );
+  });
+});
+
+describe('client.wasm', () => {
+  it('upload from bytes sends multipart/form-data', async () => {
+    let contentType: string | null = null;
+    let rawBody = '';
+    server.use(
+      http.post(`${BASE_URL}/api/pulse/wasm-modules`, async ({ request }) => {
+        contentType = request.headers.get('content-type');
+        rawBody = await request.text();
+        return HttpResponse.json(
+          { name: 'pii-redactor', sha256: 'abc', version: 1, sizeBytes: 4 },
+          { status: 201 },
+        );
+      }),
+    );
+
+    const meta = await newClient('fake.jwt').wasm.upload({
+      name: 'pii-redactor',
+      data: VALID_WASM,
+      description: 'redacts PII',
+    });
+
+    expect(meta.name).toBe('pii-redactor');
+    expect(contentType).toMatch(/multipart\/form-data/);
+    // The form carries the text fields + the file part named "module".
+    expect(rawBody).toContain('name="name"');
+    expect(rawBody).toContain('pii-redactor');
+    expect(rawBody).toContain('name="description"');
+    expect(rawBody).toContain('redacts PII');
+    expect(rawBody).toContain('name="module"');
+  });
+
+  it('upload omits description when not provided', async () => {
+    let rawBody = '';
+    server.use(
+      http.post(`${BASE_URL}/api/pulse/wasm-modules`, async ({ request }) => {
+        rawBody = await request.text();
+        return HttpResponse.json({ name: 'm', version: 1 }, { status: 201 });
+      }),
+    );
+    await newClient('fake.jwt').wasm.upload({ name: 'm', data: VALID_WASM });
+    expect(rawBody).not.toContain('name="description"');
+  });
+
+  it('upload requires exactly one of data/path', async () => {
+    const client = newClient('fake.jwt');
+    await expect(client.wasm.upload({ name: 'm' })).rejects.toThrow(/exactly one/);
+    await expect(
+      client.wasm.upload({ name: 'm', data: new Uint8Array([1]), path: 'x' }),
+    ).rejects.toThrow(/exactly one/);
+  });
+
+  it('upload rejects a non-conforming module WITHOUT a network call', async () => {
+    // No MSW handler registered — onUnhandledRequest:'error' makes any fetch
+    // throw. Reaching the PulseValidationError assertion proves the client
+    // rejected client-side, before the wire.
+    const client = newClient('fake.jwt');
+    // bad magic
+    await expect(
+      client.wasm.upload({ name: 'm', data: hex('de ad be ef 01 00 00 00') }),
+    ).rejects.toBeInstanceOf(PulseValidationError);
+    // host import
+    await expect(
+      client.wasm.upload({ name: 'm', data: WASM_WITH_IMPORT }),
+    ).rejects.toThrow(/imports host functions/);
+    // missing required exports
+    await expect(
+      client.wasm.upload({ name: 'm', data: WASM_MISSING_EXPORT }),
+    ).rejects.toThrow(/must export alloc, process and memory/);
+  });
+
+  it('upload rejects empty bytes', async () => {
+    await expect(
+      newClient('fake.jwt').wasm.upload({ name: 'm', data: new Uint8Array(0) }),
+    ).rejects.toThrow(/empty/);
+  });
+
+  it('upload rejects blank name', async () => {
+    await expect(
+      newClient('fake.jwt').wasm.upload({ name: '  ', data: new Uint8Array([1]) }),
+    ).rejects.toThrow(/name/);
+  });
+
+  it('list unwraps the {modules:[...]} envelope', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/wasm-modules`, () =>
+        HttpResponse.json({ modules: [{ name: 'pii-redactor' }] }),
+      ),
+    );
+    const modules = await newClient('fake.jwt').wasm.list();
+    expect(modules[0]!.name).toBe('pii-redactor');
+  });
+
+  it('list returns [] when the envelope is missing', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/wasm-modules`, () => HttpResponse.json({})),
+    );
+    const modules = await newClient('fake.jwt').wasm.list();
+    expect(modules).toEqual([]);
+  });
+
+  it('get returns metadata', async () => {
+    server.use(
+      http.get(`${BASE_URL}/api/pulse/wasm-modules/pii-redactor`, () =>
+        HttpResponse.json({ name: 'pii-redactor', version: 2 }),
+      ),
+    );
+    const meta = await newClient('fake.jwt').wasm.get('pii-redactor');
+    expect(meta.version).toBe(2);
+  });
+
+  it('delete issues DELETE', async () => {
+    let called = false;
+    server.use(
+      http.delete(`${BASE_URL}/api/pulse/wasm-modules/pii-redactor`, () => {
+        called = true;
+        return HttpResponse.json({ deleted: 'pii-redactor' });
+      }),
+    );
+    await newClient('fake.jwt').wasm.delete('pii-redactor');
     expect(called).toBe(true);
   });
 });
