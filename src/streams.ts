@@ -317,6 +317,16 @@ export interface MlPredictOptions {
   onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
 }
 
+/** B-110 — options passed to {@link StreamBuilder.wasm}. */
+export interface WasmOptions {
+  /** Registered module name (see `client.wasm.upload`). */
+  module: string;
+  /** Max concurrent module invocations. */
+  parallelism?: number;
+  ordering?: 'PRESERVE_INPUT' | 'UNORDERED';
+  onFailure?: 'EMIT_ERROR' | 'DROP' | 'PASS_THROUGH';
+}
+
 /** Constructor options for {@link StreamBuilder}. */
 export interface StreamBuilderOptions {
   description?: string;
@@ -616,6 +626,44 @@ export class StreamBuilder {
       inputFields: [...options.inputFields],
       outputField: options.outputField,
     };
+    if (options.parallelism !== undefined) op.parallelism = options.parallelism;
+    if (options.ordering !== undefined) op.ordering = options.ordering;
+    if (options.onFailure !== undefined) op.onFailure = options.onFailure;
+    this.ops.push(op);
+    return this;
+  }
+
+  /**
+   * B-110 — run a sandboxed WASM module over each event.
+   *
+   * The uploaded module (see `client.wasm.upload`) receives the event payload
+   * bytes and returns the new payload (transform / map) or drops the event
+   * (filter), running in pure-Java Chicory on the engine — no host syscalls,
+   * bounded linear memory. Any `wasm32` toolchain (Rust, TinyGo,
+   * AssemblyScript, C) can author a module against the alloc/process ABI.
+   */
+  public wasm(options: WasmOptions): this {
+    requireNonBlank('module', options.module);
+    if (
+      options.ordering !== undefined &&
+      options.ordering !== 'PRESERVE_INPUT' &&
+      options.ordering !== 'UNORDERED'
+    ) {
+      throw new Error(
+        `ordering must be PRESERVE_INPUT or UNORDERED, got ${JSON.stringify(options.ordering)}`,
+      );
+    }
+    if (
+      options.onFailure !== undefined &&
+      options.onFailure !== 'EMIT_ERROR' &&
+      options.onFailure !== 'DROP' &&
+      options.onFailure !== 'PASS_THROUGH'
+    ) {
+      throw new Error(
+        `onFailure must be EMIT_ERROR, DROP, or PASS_THROUGH, got ${JSON.stringify(options.onFailure)}`,
+      );
+    }
+    const op: Record<string, unknown> = { type: 'wasm', module: options.module };
     if (options.parallelism !== undefined) op.parallelism = options.parallelism;
     if (options.ordering !== undefined) op.ordering = options.ordering;
     if (options.onFailure !== undefined) op.onFailure = options.onFailure;
