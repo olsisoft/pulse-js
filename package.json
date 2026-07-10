@@ -1,6 +1,6 @@
 {
   "name": "@olsisoft/pulse-client",
-  "version": "2.6.1",
+  "version": "2.7.9",
   "description": "Official JavaScript / TypeScript client for StreamFlow Pulse — AI Agent Platform",
   "keywords": [
     "pulse",

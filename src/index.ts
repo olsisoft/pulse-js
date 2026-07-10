@@ -36,6 +36,9 @@ export {
   type StreamOptions,
   TemplatesResource,
   UsersResource,
+  validateWasmModule,
+  type WasmUploadOptions,
+  WasmResource,
 } from './client.js';
 
 export {
@@ -73,9 +76,10 @@ export {
   type StreamBuilderOptions,
   StreamsResource,
   type ToTopicOptions,
+  type WasmOptions,
   type WindowOptions,
   WindowSpec,
   windows,
 } from './streams.js';
 
-export const VERSION = '2.6.1';
+export const VERSION = '2.7.9';
