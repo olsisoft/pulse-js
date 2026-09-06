@@ -22,7 +22,7 @@ import {
 } from './errors.js';
 import { StreamsResource } from './streams.js';
 
-const USER_AGENT = 'pulse-client-js/2.6.0';
+const USER_AGENT = 'pulse-client-js/2.7.10';
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 export interface PulseClientOptions {
@@ -37,7 +37,28 @@ export interface PulseClientOptions {
    * a runtime that doesn't expose a global `fetch` (older Node, edge runtimes).
    */
   fetch?: typeof fetch;
+
+  /**
+   * Opt-in automatic retries. `0` (default) means retries are OFF — exactly one
+   * attempt per request. When > 0, retries use bounded full-jitter exponential
+   * backoff: 429 (rate limited) is retried for any method honouring
+   * `Retry-After`; `retryOnStatus` 5xx and transport errors are retried only for
+   * idempotent methods (unless `retryNonIdempotent`); terminal 4xx never retry.
+   */
+  maxRetries?: number;
+  /** Base backoff in ms for the full-jitter exponential backoff. Default 200. */
+  retryBackoffMs?: number;
+  /** Per-attempt backoff cap in ms. Default 10000. */
+  retryMaxBackoffMs?: number;
+  /** Retryable 5xx statuses. Default `[502, 503, 504]`. */
+  retryOnStatus?: number[];
+  /** Also retry non-idempotent methods (POST/PATCH) on 5xx/transport. Default false. */
+  retryNonIdempotent?: boolean;
 }
+
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS']);
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 interface RequestOptions {
   method: string;
@@ -66,6 +87,12 @@ export class PulseClient {
   private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
 
+  private readonly maxRetries: number;
+  private readonly retryBackoffMs: number;
+  private readonly retryMaxBackoffMs: number;
+  private readonly retryOnStatus: Set<number>;
+  private readonly retryNonIdempotent: boolean;
+
   public token: string | undefined;
 
   public readonly auth: AuthResource;
@@ -77,12 +104,20 @@ export class PulseClient {
   public readonly iq: IQResource;
   public readonly streams: StreamsResource;
   public readonly models: ModelsResource;
+  public readonly wasm: WasmResource;
   public readonly connectors: ConnectorsResource;
+  public readonly pvsc: PvscResource;
+  public readonly evals: EvalsResource;
 
   constructor(options: PulseClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, '');
     this.token = options.token;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.maxRetries = Math.max(0, options.maxRetries ?? 0);
+    this.retryBackoffMs = options.retryBackoffMs ?? 200;
+    this.retryMaxBackoffMs = options.retryMaxBackoffMs ?? 10_000;
+    this.retryOnStatus = new Set(options.retryOnStatus ?? [502, 503, 504]);
+    this.retryNonIdempotent = options.retryNonIdempotent ?? false;
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     if (typeof this.fetchImpl !== 'function') {
       throw new PulseClientError(
@@ -98,7 +133,10 @@ export class PulseClient {
     this.iq = new IQResource(this);
     this.streams = new StreamsResource(this);
     this.models = new ModelsResource(this);
+    this.wasm = new WasmResource(this);
     this.connectors = new ConnectorsResource(this);
+    this.pvsc = new PvscResource(this);
+    this.evals = new EvalsResource(this);
   }
 
   /**
@@ -195,7 +233,57 @@ export class PulseClient {
   }
 
   /** @internal — used by resource classes; intentionally not part of the public surface. */
+  /**
+   * Runs {@link requestOnce} under the opt-in retry policy. With retries off
+   * (`maxRetries === 0`, the default) it makes exactly one attempt.
+   */
   public async request(opts: RequestOptions): Promise<unknown> {
+    const idempotent = IDEMPOTENT_METHODS.has(opts.method.toUpperCase());
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await this.requestOnce(opts);
+      } catch (err) {
+        if (attempt >= this.maxRetries) throw err;
+        const delay = this.retryDelay(err, idempotent, attempt);
+        if (delay === null) throw err;
+        await sleep(delay);
+        attempt += 1;
+      }
+    }
+  }
+
+  /**
+   * Returns the delay (ms) to wait before retrying `err` for an `idempotent`
+   * method, or `null` when it must not be retried. 429 → any method (honour
+   * Retry-After); `retryOnStatus` 5xx + transport → idempotent only (unless
+   * `retryNonIdempotent`); terminal 4xx / client errors → never.
+   */
+  private retryDelay(err: unknown, idempotent: boolean, attempt: number): number | null {
+    if (err instanceof PulseRateLimitError) {
+      return err.retryAfterSeconds != null && err.retryAfterSeconds > 0
+        ? err.retryAfterSeconds * 1000
+        : this.backoffDelay(attempt);
+    }
+    if (!idempotent && !this.retryNonIdempotent) return null;
+    if (err instanceof PulseAPIError) {
+      return this.retryOnStatus.has(err.statusCode) ? this.backoffDelay(attempt) : null;
+    }
+    if (err instanceof PulseClientError) {
+      // no-token / other client-side error — deterministic, never retried.
+      return null;
+    }
+    // A non-Pulse rejection == the transport itself failed (network/abort) → retry.
+    return this.backoffDelay(attempt);
+  }
+
+  /** Full-jitter exponential backoff: uniform in [0, min(max, base * 2^attempt)). */
+  private backoffDelay(attempt: number): number {
+    const ceiling = Math.min(this.retryMaxBackoffMs, this.retryBackoffMs * 2 ** attempt);
+    return Math.random() * ceiling;
+  }
+
+  private async requestOnce(opts: RequestOptions): Promise<unknown> {
     const { method, path, body, authenticated = true } = opts;
     const headers: Record<string, string> = {
       'User-Agent': USER_AGENT,
@@ -307,8 +395,8 @@ export class AuthResource extends Resource {
       body: { username, password },
       authenticated: false,
     })) as Record<string, unknown>;
-    if (typeof response.token === 'string') {
-      this.client.token = response.token;
+    if (typeof (response.accessToken ?? response.token) === 'string') {
+      this.client.token = (response.accessToken ?? response.token) as string;
     }
     return response;
   }
@@ -321,8 +409,8 @@ export class AuthResource extends Resource {
       body: { refreshToken },
       authenticated: false,
     })) as Record<string, unknown>;
-    if (typeof response.token === 'string') {
-      this.client.token = response.token;
+    if (typeof (response.accessToken ?? response.token) === 'string') {
+      this.client.token = (response.accessToken ?? response.token) as string;
     }
     return response;
   }
@@ -348,8 +436,8 @@ export class AuthResource extends Resource {
       path: '/api/auth/switch-org',
       body: { orgId },
     })) as Record<string, unknown>;
-    if (typeof response.token === 'string') {
-      this.client.token = response.token;
+    if (typeof (response.accessToken ?? response.token) === 'string') {
+      this.client.token = (response.accessToken ?? response.token) as string;
     }
     return response;
   }
@@ -631,6 +719,233 @@ export class ModelsResource extends Resource {
     await this.client.request({
       method: 'DELETE',
       path: `/api/pulse/ml-models/${encodeURIComponent(name)}`,
+    });
+  }
+}
+
+/** Options passed to {@link WasmResource.upload}. */
+export interface WasmUploadOptions {
+  /** Module name referenced by `wasm({ module })`. */
+  name: string;
+  /** Raw module bytes (alternative to {@link path}). */
+  data?: Uint8Array | Buffer;
+  /** Filesystem path to the `.wasm` file (alternative to {@link data}). */
+  path?: string;
+  /** Optional human-readable description stored alongside the module. */
+  description?: string;
+}
+
+/**
+ * Client-side pre-upload validation of a WASM module's bytes.
+ *
+ * Mirrors the server's `ChicoryWasmRunner.validateModule`: inspects the binary
+ * (it does NOT execute it) and throws {@link PulseValidationError} on a module
+ * that the server would reject — a pure sandbox that exports `alloc`,
+ * `process`, and `memory` and imports no host functions. Rejecting locally
+ * turns a cryptic server 400 / runtime trap into an actionable client error.
+ *
+ * The check is deliberately conservative: it only rejects modules it can prove
+ * are non-conforming (bad magic, host imports, missing required exports). A
+ * malformed binary that can't be walked throws "malformed WASM module".
+ */
+export function validateWasmModule(bytes: Uint8Array): void {
+  const fail = (message: string): never => {
+    throw new PulseValidationError(400, 'wasm.upload (client-side validation)', {
+      error: message,
+    });
+  };
+
+  if (bytes.length < 8) {
+    fail('not a WASM module: too short');
+  }
+
+  // Magic "\0asm" + version 0x01 0x00 0x00 0x00.
+  if (
+    bytes[0] !== 0x00 ||
+    bytes[1] !== 0x61 ||
+    bytes[2] !== 0x73 ||
+    bytes[3] !== 0x6d ||
+    bytes[4] !== 0x01 ||
+    bytes[5] !== 0x00 ||
+    bytes[6] !== 0x00 ||
+    bytes[7] !== 0x00
+  ) {
+    fail('not a WASM module (bad magic/version)');
+  }
+
+  /** Reads an unsigned LEB128 at `cursor.pos`, advancing it. Throws on overrun. */
+  const readUleb = (cursor: { pos: number }): number => {
+    let result = 0;
+    let shift = 0;
+    for (;;) {
+      if (cursor.pos >= bytes.length) {
+        fail('malformed WASM module');
+      }
+      const byte = bytes[cursor.pos++];
+      result |= (byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) break;
+      shift += 7;
+      if (shift > 35) {
+        fail('malformed WASM module');
+      }
+    }
+    return result >>> 0;
+  };
+
+  const exportNames = new Set<string>();
+  let offset = 8;
+  while (offset < bytes.length) {
+    const id = bytes[offset++];
+    const cursor = { pos: offset };
+    const size = readUleb(cursor);
+    const payloadStart = cursor.pos;
+    const payloadEnd = payloadStart + size;
+    if (payloadEnd > bytes.length) {
+      fail('malformed WASM module');
+    }
+
+    if (id === 2) {
+      // Import section — any host import means the module is not a pure sandbox.
+      const importCursor = { pos: payloadStart };
+      const count = readUleb(importCursor);
+      if (count > 0) {
+        fail(
+          'WASM module imports host functions; it must be a pure sandbox ' +
+            '(build with no WASI/host imports)',
+        );
+      }
+    } else if (id === 7) {
+      // Export section — collect the exported names.
+      const exportCursor = { pos: payloadStart };
+      const count = readUleb(exportCursor);
+      for (let i = 0; i < count; i++) {
+        const nameLen = readUleb(exportCursor);
+        const nameStart = exportCursor.pos;
+        const nameEnd = nameStart + nameLen;
+        if (nameEnd > payloadEnd) {
+          fail('malformed WASM module');
+        }
+        let name = '';
+        for (let j = nameStart; j < nameEnd; j++) {
+          name += String.fromCharCode(bytes[j]);
+        }
+        exportCursor.pos = nameEnd;
+        // 1 kind byte + uleb128 index.
+        if (exportCursor.pos >= payloadEnd) {
+          fail('malformed WASM module');
+        }
+        exportCursor.pos += 1; // kind
+        readUleb(exportCursor); // index
+        exportNames.add(name);
+      }
+    }
+
+    offset = payloadEnd;
+  }
+
+  if (!exportNames.has('alloc') || !exportNames.has('process') || !exportNames.has('memory')) {
+    fail('WASM module must export alloc, process and memory');
+  }
+}
+
+/**
+ * client.wasm — B-110 sandboxed WASM module registry.
+ *
+ * Upload WebAssembly modules that the streaming {@link StreamBuilder.wasm}
+ * operator runs over events, sandboxed in pure-Java Chicory on the engine
+ * (no host syscalls). Modules are org-scoped; upload / delete require the
+ * ADMIN role.
+ *
+ * @example
+ * ```ts
+ * await client.wasm.upload({ name: 'pii-redactor', path: './redactor.wasm' });
+ * builder.fromTopic('events').wasm({ module: 'pii-redactor' }).toTopic('clean');
+ * ```
+ */
+export class WasmResource extends Resource {
+  /**
+   * POST /api/pulse/wasm-modules — upload (or replace) a module as
+   * multipart/form-data. Supply the module either by `data` bytes or file
+   * `path` (exactly one). The module is validated (must parse, import no host
+   * functions, export alloc/process/memory) before persisting. Replacing an
+   * existing name hot-swaps the module with no agent restart. Returns the
+   * persisted module metadata.
+   */
+  public async upload(options: WasmUploadOptions): Promise<Record<string, unknown>> {
+    if (typeof options.name !== 'string' || !options.name.trim()) {
+      throw new PulseClientError('name must be a non-empty string');
+    }
+    const hasData = options.data !== undefined;
+    const hasPath = options.path !== undefined;
+    if (hasData === hasPath) {
+      throw new PulseClientError("provide exactly one of 'path' or 'data'");
+    }
+
+    let blob: Uint8Array;
+    let filename: string;
+    if (hasPath) {
+      const { readFile } = await import('node:fs/promises');
+      blob = await readFile(options.path as string);
+      filename = (options.path as string).split('/').pop() ?? `${options.name}.wasm`;
+    } else {
+      blob = options.data as Uint8Array;
+      filename = `${options.name}.wasm`;
+    }
+    if (blob.length === 0) {
+      throw new PulseClientError('module bytes are empty');
+    }
+
+    // Client-side pre-upload validation — reject a non-conforming module
+    // locally (before the network round-trip) rather than as a cryptic
+    // server 400 / runtime trap. Mirrors ChicoryWasmRunner.validateModule.
+    validateWasmModule(blob);
+
+    const form = new FormData();
+    form.append('name', options.name);
+    if (options.description !== undefined) {
+      form.append('description', options.description);
+    }
+    // Copy into a fresh ArrayBuffer so Blob gets a clean, exactly-sized buffer
+    // regardless of any Buffer pooling / view offset on the input.
+    const bytes = new Uint8Array(blob.length);
+    bytes.set(blob);
+    form.append('module', new Blob([bytes], { type: 'application/wasm' }), filename);
+
+    return (await this.client.requestMultipart(
+      '/api/pulse/wasm-modules',
+      form,
+    )) as Record<string, unknown>;
+  }
+
+  /** GET /api/pulse/wasm-modules — modules registered for the caller's org. */
+  public async list(): Promise<Record<string, unknown>[]> {
+    const result = (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/wasm-modules',
+    })) as Record<string, unknown>;
+    const modules = result?.modules;
+    return Array.isArray(modules) ? (modules as Record<string, unknown>[]) : [];
+  }
+
+  /** GET /api/pulse/wasm-modules/{name} — metadata for one module. */
+  public async get(name: string): Promise<Record<string, unknown>> {
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new PulseClientError('name must be a non-empty string');
+    }
+    return (await this.client.request({
+      method: 'GET',
+      path: `/api/pulse/wasm-modules/${encodeURIComponent(name)}`,
+    })) as Record<string, unknown>;
+  }
+
+  /** DELETE /api/pulse/wasm-modules/{name} — remove a module (ADMIN). */
+  public async delete(name: string): Promise<void> {
+    if (typeof name !== 'string' || !name.trim()) {
+      throw new PulseClientError('name must be a non-empty string');
+    }
+    await this.client.request({
+      method: 'DELETE',
+      path: `/api/pulse/wasm-modules/${encodeURIComponent(name)}`,
     });
   }
 }
@@ -1043,4 +1358,264 @@ function buildIQScanQuery(options: IQScanOptions): string {
   if (options.start !== undefined) params.set('start', options.start);
   if (options.end !== undefined) params.set('end', options.end);
   return `?${params.toString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// PVSC — the governance surface
+// ---------------------------------------------------------------------------
+
+/**
+ * One field's rule inside a topic schema.
+ *
+ * `grounding` is the one field worth explaining: it asks whether the value an
+ * agent writes here must be traceable to what the agent was given.
+ * `'required'` blocks an untraceable value, `'warn'` reports it, and the
+ * default `'ignore'` does not look. It is what catches a figure that is
+ * well-typed, in range, confidently asserted and invented — every other check
+ * in the schema passes such a value.
+ */
+export interface PvscFieldRule {
+  type: string;
+  min?: number | null;
+  max?: number | null;
+  minLength?: number | null;
+  maxLength?: number | null;
+  allowedValues?: string[] | null;
+  grounding?: 'ignore' | 'warn' | 'required';
+}
+
+/** A topic's contract, as `PUT /api/pulse/pvsc/schemas` accepts it. */
+export interface PvscTopicSchema {
+  topic: string;
+  requiredFields?: Record<string, PvscFieldRule>;
+  optionalFields?: Record<string, PvscFieldRule>;
+  allowExtraFields?: boolean;
+  keyPolicy?: { required: boolean; pattern?: string | null; description?: string | null } | null;
+}
+
+/**
+ * One arbitration stance. Attached to the guardian that votes, never read out
+ * of what the vote says. Lower `precedence` wins — rank 1 outranks rank 2 —
+ * and a `veto` stance blocks by construction rather than by count.
+ */
+export interface PvscStance {
+  domain: string;
+  precedence: number;
+  veto: boolean;
+}
+
+/** client.pvsc — topic contracts, arbitration policy, guardians and the DLQ. */
+export class PvscResource extends Resource {
+  /** GET /api/pulse/pvsc/schemas — every registered topic contract. */
+  public async schemas(): Promise<Record<string, unknown>[]> {
+    const result = (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/pvsc/schemas',
+    })) as Record<string, unknown>;
+    const schemas = result?.schemas;
+    return Array.isArray(schemas) ? (schemas as Record<string, unknown>[]) : [];
+  }
+
+  /**
+   * PUT /api/pulse/pvsc/schemas — registers or replaces a topic's contract.
+   *
+   * The write REPLACES the schema, it does not merge into it: a field you
+   * omit is gone, including its grounding policy. Read the current schema
+   * first if you are changing one field of several.
+   */
+  public async saveSchema(schema: PvscTopicSchema): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'PUT',
+      path: '/api/pulse/pvsc/schemas',
+      body: schema,
+    })) as Record<string, unknown>;
+  }
+
+  /** DELETE /api/pulse/pvsc/schemas — drops a topic's contract. */
+  public async deleteSchema(topic: string): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'DELETE',
+      path: '/api/pulse/pvsc/schemas',
+      body: { topic },
+    })) as Record<string, unknown>;
+  }
+
+  /** GET /api/pulse/pvsc/config — consensus, degradation and arbitration settings. */
+  public async config(): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/pvsc/config',
+    })) as Record<string, unknown>;
+  }
+
+  /** PUT /api/pulse/pvsc/config — patches the settings named in `patch`. */
+  public async updateConfig(patch: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'PUT',
+      path: '/api/pulse/pvsc/config',
+      body: patch,
+    })) as Record<string, unknown>;
+  }
+
+  /**
+   * Replaces the arbitration stances. Sugar over `updateConfig`, and the
+   * shape most callers want: an empty list disables arbitration, so the
+   * majority result stands.
+   */
+  public async setStances(stances: PvscStance[]): Promise<Record<string, unknown>> {
+    return this.updateConfig({ arbitrationStances: stances });
+  }
+
+  /**
+   * GET /api/pulse/pvsc/metrics — counters plus the quorum information yield
+   * (`quorumInformationYield`, `quorumRedundantGuardianCalls`,
+   * `quorumInterpretation`), which say whether consulting the quorum changed
+   * any decision the first guardian would have made alone.
+   */
+  public async metrics(): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/pvsc/metrics',
+    })) as Record<string, unknown>;
+  }
+
+  /** GET /api/pulse/pvsc/guardians — the registered guardian pool. */
+  public async guardians(): Promise<Record<string, unknown>[]> {
+    const result = (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/pvsc/guardians',
+    })) as Record<string, unknown>;
+    const guardians = result?.guardians;
+    return Array.isArray(guardians) ? (guardians as Record<string, unknown>[]) : [];
+  }
+
+  /** GET /api/pulse/pvsc/dlq — events the firewall turned away. */
+  public async dlq(): Promise<Record<string, unknown>[]> {
+    const result = (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/pvsc/dlq',
+    })) as Record<string, unknown>;
+    const entries = result?.entries;
+    return Array.isArray(entries) ? (entries as Record<string, unknown>[]) : [];
+  }
+
+  /** POST /api/pulse/pvsc/dlq/reinject — replays one blocked event. */
+  public async reinject(eventId: string): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'POST',
+      path: '/api/pulse/pvsc/dlq/reinject',
+      body: { eventId },
+    })) as Record<string, unknown>;
+  }
+
+  /** POST /api/pulse/pvsc/dlq/discard — drops one blocked event for good. */
+  public async discard(eventId: string): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'POST',
+      path: '/api/pulse/pvsc/dlq/discard',
+      body: { eventId },
+    })) as Record<string, unknown>;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Evals — golden cases with a ratcheting non-regression gate
+// ---------------------------------------------------------------------------
+
+/** One golden case: an input plus what its agent's output must satisfy. */
+export interface EvalCase {
+  caseId?: string;
+  suiteId: string;
+  name: string;
+  agentKey: string;
+  inputPayload: string;
+  expectations: Record<string, unknown>;
+  provenanceTrajectoryId?: string | null;
+}
+
+/**
+ * The verdict of one run. `gate` is `HOLDING` / `IMPROVED` / `REGRESSION` /
+ * `NO_BASELINE`, and `blocksRelease` is what a pipeline should branch on.
+ */
+export interface EvalReport {
+  suiteId: string;
+  total: number;
+  passing: number;
+  failing: number;
+  baseline: number;
+  gate: string;
+  blocksRelease: boolean;
+  summary: string;
+  cases: Array<{
+    caseId: string; name: string; verdict: string;
+    failedPaths: string[]; detail: string;
+  }>;
+}
+
+/**
+ * client.evals — golden cases replayed against live agents.
+ *
+ * The gate counts PASSES against a recorded floor rather than counting
+ * failures, so deleting an assertion cannot satisfy it. Cases run
+ * node-isolated: nothing is persisted, published to a downstream topic, or
+ * acted on, which is what makes it safe to run a suite against production
+ * agents.
+ */
+export class EvalsResource extends Resource {
+  /** GET /api/pulse/evals — the suite ids that have at least one case. */
+  public async suites(): Promise<string[]> {
+    const result = (await this.client.request({
+      method: 'GET',
+      path: '/api/pulse/evals',
+    })) as Record<string, unknown>;
+    const suites = result?.suites;
+    return Array.isArray(suites) ? (suites as string[]) : [];
+  }
+
+  /** GET /api/pulse/evals/cases?suite= — the cases in one suite. */
+  public async cases(suiteId: string): Promise<Record<string, unknown>[]> {
+    const result = (await this.client.request({
+      method: 'GET',
+      path: `/api/pulse/evals/cases?suite=${encodeURIComponent(suiteId)}`,
+    })) as Record<string, unknown>;
+    const cases = result?.cases;
+    return Array.isArray(cases) ? (cases as Record<string, unknown>[]) : [];
+  }
+
+  /** POST /api/pulse/evals/cases — adds or replaces one case. */
+  public async saveCase(evalCase: EvalCase): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'POST',
+      path: '/api/pulse/evals/cases',
+      body: evalCase,
+    })) as Record<string, unknown>;
+  }
+
+  /**
+   * POST /api/pulse/evals/run — replays every case in the suite.
+   *
+   * A REGRESSION comes back as a normal response with `blocksRelease: true`,
+   * not as an error: the run succeeded and the gate's verdict is data. Branch
+   * on `blocksRelease`, not on whether this call threw.
+   */
+  public async run(suiteId: string): Promise<EvalReport> {
+    return (await this.client.request({
+      method: 'POST',
+      path: '/api/pulse/evals/run',
+      body: { suiteId },
+    })) as unknown as EvalReport;
+  }
+
+  /**
+   * POST /api/pulse/evals/baseline — records the current passing count as the
+   * floor future runs are held to. Call it after a run you are happy with;
+   * calling it after a bad one ratchets the floor DOWN.
+   */
+  public async recordBaseline(suiteId: string): Promise<Record<string, unknown>> {
+    return (await this.client.request({
+      method: 'POST',
+      path: '/api/pulse/evals/baseline',
+      body: { suiteId },
+    })) as Record<string, unknown>;
+  }
 }
