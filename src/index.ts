@@ -20,6 +20,9 @@ export {
   AgentsResource,
   AuthResource,
   ConnectorsResource,
+  type EvalCase,
+  type EvalReport,
+  EvalsResource,
   type EventsReplayOptions,
   EventsResource,
   type IQDiffOptions,
@@ -31,11 +34,18 @@ export {
   type ModelUploadOptions,
   ModelsResource,
   PipelinesResource,
+  type PvscFieldRule,
+  PvscResource,
+  type PvscStance,
+  type PvscTopicSchema,
   PulseClient,
   type PulseClientOptions,
   type StreamOptions,
   TemplatesResource,
   UsersResource,
+  validateWasmModule,
+  type WasmUploadOptions,
+  WasmResource,
 } from './client.js';
 
 export {
@@ -73,9 +83,10 @@ export {
   type StreamBuilderOptions,
   StreamsResource,
   type ToTopicOptions,
+  type WasmOptions,
   type WindowOptions,
   WindowSpec,
   windows,
 } from './streams.js';
 
-export const VERSION = '2.6.1';
+export const VERSION = '2.7.10';

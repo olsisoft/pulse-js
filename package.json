@@ -1,6 +1,6 @@
 {
   "name": "@olsisoft/pulse-client",
-  "version": "2.6.1",
+  "version": "2.7.10",
   "description": "Official JavaScript / TypeScript client for StreamFlow Pulse — AI Agent Platform",
   "keywords": [
     "pulse",
@@ -12,16 +12,11 @@
     "mcp",
     "sdk"
   ],
-  "homepage": "https://github.com/olsisoft/pulse-js",
-  "bugs": "https://github.com/olsisoft/pulse-js/issues",
+  "homepage": "https://streamflowmesh.io",
   "license": "Apache-2.0",
   "author": {
     "name": "Njong Michael",
     "email": "mike.njo@gmail.com"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/olsisoft/pulse-js.git"
   },
   "type": "module",
   "main": "./dist/index.cjs",
