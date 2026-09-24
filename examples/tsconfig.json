@@ -1,0 +1,13 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@olsisoft/pulse-client": ["../src/index.ts"]
+    }
+  },
+  "include": ["./*.ts"],
+  "exclude": []
+}
