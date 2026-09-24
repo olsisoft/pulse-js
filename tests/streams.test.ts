@@ -485,6 +485,54 @@ describe('StreamBuilder operators', () => {
     ).toThrow(/onFailure/);
   });
 
+  // ── B-110 wasm ───────────────────────────────────────────────
+  it('wasm full shape', () => {
+    const b = new StreamBuilder().fromTopic('events').wasm({
+      module: 'pii-redactor',
+      parallelism: 4,
+      ordering: 'UNORDERED',
+      onFailure: 'PASS_THROUGH',
+    });
+    expect(b.operators()).toEqual([
+      {
+        type: 'wasm',
+        module: 'pii-redactor',
+        parallelism: 4,
+        ordering: 'UNORDERED',
+        onFailure: 'PASS_THROUGH',
+      },
+    ]);
+  });
+
+  it('wasm minimal shape', () => {
+    const b = new StreamBuilder().fromTopic('events').wasm({ module: 'pii-redactor' });
+    expect(b.operators()).toEqual([{ type: 'wasm', module: 'pii-redactor' }]);
+  });
+
+  it('wasm rejects blank module', () => {
+    expect(() => new StreamBuilder().fromTopic('in').wasm({ module: '' })).toThrow(/module/);
+  });
+
+  it('wasm rejects bad ordering', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').wasm({
+        module: 'm',
+        // @ts-expect-error — invalid ordering value rejected at runtime
+        ordering: 'SHUFFLED',
+      }),
+    ).toThrow(/ordering/);
+  });
+
+  it('wasm rejects bad onFailure', () => {
+    expect(() =>
+      new StreamBuilder().fromTopic('in').wasm({
+        module: 'm',
+        // @ts-expect-error — invalid onFailure value rejected at runtime
+        onFailure: 'RETRY',
+      }),
+    ).toThrow(/onFailure/);
+  });
+
   it('broadcastJoin full shape', () => {
     const b = new StreamBuilder().fromTopic('in').broadcastJoin({
       joinKeyField: 'userId',
