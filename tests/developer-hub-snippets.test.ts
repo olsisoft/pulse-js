@@ -16,18 +16,23 @@
  */
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
 
 import { transformSync } from 'esbuild';
 import { describe, it, expect } from 'vitest';
 
 import { StreamBuilder, windows, aggs } from '../src/index.js';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const DOCS_DIR = path.resolve(
-  HERE,
-  '../../streamflow-pulse/src/main/resources/developer-hub',
-);
+const fixtureValue = process.env.PULSE_PUBLIC_RESOURCE_FIXTURE;
+if (!fixtureValue) throw new Error('PULSE_PUBLIC_RESOURCE_FIXTURE required; run tools/prepare-public-resources.py');
+const fixture = path.resolve(fixtureValue);
+const manifest = JSON.parse(readFileSync(path.join(fixture, 'manifest.json'), 'utf8')) as { source_repository: string; resources: Array<{path:string;sha256:string}> };
+if (manifest.source_repository !== 'olsisoft/pulse' || !manifest.resources?.length) throw new Error('Canonical Pulse public fixture manifest required');
+for (const item of manifest.resources) {
+  const target = path.resolve(fixture, item.path);
+  if (!target.startsWith(fixture + path.sep) || createHash('sha256').update(readFileSync(target)).digest('hex') !== item.sha256) throw new Error('Canonical public fixture digest mismatch');
+}
+const DOCS_DIR = path.join(fixture, 'developer-hub');
 
 const TS_BLOCK = /```ts\n([\s\S]*?)\n```/g;
 
@@ -38,7 +43,7 @@ interface Snippet {
 }
 
 function tsSnippets(): Snippet[] {
-  if (!existsSync(DOCS_DIR)) return [];
+  if (!existsSync(DOCS_DIR)) throw new Error('Canonical packaged developer-hub docs missing');
   const out: Snippet[] = [];
   for (const file of readdirSync(DOCS_DIR).filter((f) => f.endsWith('.md')).sort()) {
     const md = readFileSync(path.join(DOCS_DIR, file), 'utf8');
@@ -101,12 +106,7 @@ async function execDsl(code: string): Promise<void> {
 }
 
 const SNIPPETS = tsSnippets();
-// Monorepo-only: the developer-hub Markdown lives in streamflow-pulse, which
-// isn't present in the lifted satellite repo — skip the whole suite there
-// (mirrors the Python test's pytest.skip-when-docs-absent behaviour).
-const DOCS_PRESENT = existsSync(DOCS_DIR);
-
-describe.skipIf(!DOCS_PRESENT)('developer-hub TypeScript snippets', () => {
+describe('developer-hub TypeScript snippets', () => {
   it('the docs ship at least one ts snippet', () => {
     expect(SNIPPETS.length).toBeGreaterThan(0);
   });

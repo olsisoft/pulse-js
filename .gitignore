@@ -16,3 +16,6 @@ npm-debug.log*
 
 # tsc / tsup
 *.tsbuildinfo
+
+# Explicit local packaged public API fixtures
+.pulse-public-resources/
